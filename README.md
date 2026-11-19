@@ -24,7 +24,7 @@ curl -fLO "$url/$archive" && curl -fLO "$url/$archive.sha256" &&
 Start your application first. For a service listening on `127.0.0.1:3000`:
 
 ```console
-$ ./portable-opentunnel 3000 --ephemeral
+$ ./portable-opentunnel ephemeral 3000
 https://k3f9x2m1q7zt.abcd1234.opentunnel.xyz
 ```
 
@@ -35,33 +35,32 @@ connected, not that your application is healthy. Diagnostics go to stderr.
 **The URL is public.** Only expose services intended to be reachable from the
 internet, and configure application authentication if needed.
 
-`--ephemeral` creates a new identity in a private directory under `$TMPDIR`
+`ephemeral` creates a new identity in a private directory under `$TMPDIR`
 (or `/tmp`). Press Ctrl+C to stop forwarding and attempt cleanup.
 
 ## Reuse the same URL
 
-Use `--directory DIR` **instead of** `--ephemeral`. The identity and URL are
-saved there. Run again with the same directory to get the same URL, even if
-the local port changes.
+Use `up` with `--dir DIR`. It forwards in the foreground and saves the identity
+and URL in that directory. Run `up` again with the same directory to get the
+same URL, even if the local port changes.
 
 ```sh
-./portable-opentunnel 3000 --directory ./my-tunnel
+./portable-opentunnel up 3000 --dir ./my-tunnel
 ```
 
-Give concurrent jobs separate directories. If you reuse a directory across
-nodes, use shared storage with reliable cross-node locking.
+Give concurrent jobs separate directories.
 
-`init`, `url`, and `delete` also require `--directory`:
+`init`, `url`, and `delete` also require `--dir`:
 
 ```sh
-./portable-opentunnel init   --directory ./my-tunnel  # create an identity, without forwarding
-./portable-opentunnel url    --directory ./my-tunnel  # print the saved URL offline
-./portable-opentunnel delete --directory ./my-tunnel  # retire the identity and remove its state
+./portable-opentunnel init   --dir ./my-tunnel  # create an identity, without forwarding
+./portable-opentunnel url    --dir ./my-tunnel  # print the saved URL offline
+./portable-opentunnel delete --dir ./my-tunnel  # retire the identity and remove its state
 ```
 
 If cleanup fails, keep the state directory and retry `delete` with the path
-shown on stderr. Supply your private CA again if you used one. See the
-[recovery guide](docs/operations.md#state-and-recovery) for details.
+shown on stderr. See the [recovery guide](docs/operations.md#state-and-recovery)
+for details.
 
 ## More information
 

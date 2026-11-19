@@ -49,7 +49,7 @@ impl LocalRemoval {
 /// The recovery command printed when a deletion could not complete.
 pub fn recovery_command(root: &std::path::Path) -> String {
     format!(
-        "portable-opentunnel delete --directory {}",
+        "portable-opentunnel delete --dir {}",
         shell_quote(&root.display().to_string())
     )
 }

@@ -1,23 +1,20 @@
 use std::io::Write;
+use std::time::Duration;
 
 use clap::Parser;
 
-use portable_opentunnel::cli::{self, Action, Invocation};
+use portable_opentunnel::cli::{Cli, Command};
+use portable_opentunnel::directory::Selection;
 use portable_opentunnel::error::{self, AppError};
 use portable_opentunnel::forward::{self, Completed, Run};
-use portable_opentunnel::{directory, remove, signals, trust, url};
+use portable_opentunnel::{remove, signals, trust, url};
 
 fn main() {
     // Process-wide handlers first: a signal during provisioning, attachment,
     // cleanup, or a hung exit must be noticed and, on the second one, forced.
     signals::install(true);
 
-    let cli = cli::Cli::parse();
-    let invocation = match cli.resolve() {
-        Ok(invocation) => invocation,
-        Err(error) => exit_with(error),
-    };
-    match execute(&invocation) {
+    match execute(&Cli::parse().command) {
         Ok(completed) => {
             for warning in &completed.warnings {
                 eprintln!("portable-opentunnel: warning: {warning}");
@@ -51,54 +48,52 @@ fn write_stdout(url: &str) -> Result<(), AppError> {
         .map_err(AppError::io("writing the URL to stdout"))
 }
 
-fn execute(invocation: &Invocation) -> Result<Completed, AppError> {
-    match &invocation.action {
-        // `url` is local and offline: it must not fail because a CA setting
-        // for *network* operations is unusable.
-        Action::Url => {
-            let path = directory::require_explicit(invocation.directory.as_deref())?;
-            let found = url::run(path)?;
+fn execute(command: &Command) -> Result<Completed, AppError> {
+    let (state_dir, args, target) = match command {
+        Command::Url(state) => {
+            let found = url::run(&state.directory)?;
             write_stdout(&found)?;
-            Ok(Completed {
+            return Ok(Completed {
                 url: found,
                 warnings: Vec::new(),
-            })
+            });
         }
-        Action::Delete => {
-            let path = directory::require_explicit(invocation.directory.as_deref())?;
-            let trust = trust::Trust::resolve(invocation.ca_cert.clone())?;
-            remove::run(
-                path,
-                invocation.api.as_deref(),
+        Command::Delete {
+            state,
+            network,
+            shutdown,
+        } => {
+            let trust = trust::Trust::resolve(network.ca_cert.clone())?;
+            return remove::run(
+                &state.directory,
+                network.api.as_deref(),
                 trust.ca_cert.as_deref(),
-                invocation.shutdown_timeout,
-                invocation.verbose,
-            )
+                Duration::from_secs(shutdown.shutdown_timeout),
+                network.verbose,
+            );
         }
-        action @ (Action::Init | Action::Forward(_)) => {
-            let trust = trust::Trust::resolve(invocation.ca_cert.clone())?;
-            let run = Run {
-                state_dir: if invocation.ephemeral {
-                    directory::Selection::Ephemeral
-                } else {
-                    directory::Selection::Reusable(directory::require_explicit(
-                        invocation.directory.as_deref(),
-                    )?)
-                },
-                api_override: invocation.api.as_deref(),
-                ca_cert: trust.ca_cert.as_deref(),
-                startup_timeout: invocation.startup_timeout,
-                shutdown_timeout: invocation.shutdown_timeout,
-                verbose: invocation.verbose,
-            };
-            if let Action::Forward(target) = action {
-                return forward::forward(&run, target);
-            }
-            // `init` prints the URL only after the identity exists; it never
-            // claims forwarding is ready.
-            let completed = forward::init(&run)?;
-            write_stdout(&completed.url)?;
-            Ok(completed)
-        }
+        Command::Up { state, forward } => (
+            Selection::Reusable(&state.directory),
+            &forward.run,
+            Some(&forward.target),
+        ),
+        Command::Ephemeral(forward) => (Selection::Ephemeral, &forward.run, Some(&forward.target)),
+        Command::Init { state, run } => (Selection::Reusable(&state.directory), run, None),
+    };
+
+    let trust = trust::Trust::resolve(args.network.ca_cert.clone())?;
+    let run = Run {
+        state_dir,
+        api_override: args.network.api.as_deref(),
+        ca_cert: trust.ca_cert.as_deref(),
+        startup_timeout: Duration::from_secs(args.startup_timeout),
+        shutdown_timeout: Duration::from_secs(args.shutdown.shutdown_timeout),
+        verbose: args.network.verbose,
+    };
+    if let Some(target) = target {
+        return forward::forward(&run, target);
     }
+    let completed = forward::init(&run)?;
+    write_stdout(&completed.url)?;
+    Ok(completed)
 }

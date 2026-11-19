@@ -14,7 +14,7 @@ and directory to your site:
 set -euo pipefail
 
 python3 ./serve.py --port 3000 &
-exec ./portable-opentunnel 3000 --ephemeral
+exec ./portable-opentunnel ephemeral 3000
 ```
 
 `exec` makes the wrapper the batch process, so a SIGTERM sent to that
@@ -24,11 +24,11 @@ trap. Check how your site signals and cleans up jobs.
 
 - Set `--shutdown-timeout` below your site's grace period between SIGTERM and
   SIGKILL if you need ephemeral deletion to finish.
-- `--ephemeral` always creates its own directory. Set `TMPDIR` to an existing
+- `ephemeral` always creates its own directory. Set `TMPDIR` to an existing
   parent on durable storage if you want to keep recovery credentials after
   node failure; the default temporary directory is often node-local.
-- For a stable URL, omit `--ephemeral` and supply the required `--directory`.
-  Do not share that directory between concurrent jobs.
+- For a stable URL, use `up 3000 --dir DIR` instead. Do not share that directory
+  between concurrent jobs.
 
 The public URL appears on stdout once the bridge attaches; verify application
 readiness separately. See the [operations guide](operations.md) for recovery.

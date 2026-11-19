@@ -56,23 +56,22 @@ expect_exit() {
   fi
 }
 
-expect_exit 2 "invalid target" "$binary" not-a-port
-expect_exit 2 "port 0" "$binary" 0
-expect_exit 2 "init with --ephemeral" "$binary" init --ephemeral
+expect_exit 2 "no command" "$binary"
+expect_exit 2 "invalid target" "$binary" ephemeral not-a-port
+expect_exit 2 "port 0" "$binary" ephemeral 0
 expect_exit 2 "url with a target" "$binary" url 3000
-expect_exit 2 "ephemeral forwarding with --directory" "$binary" 3000 \
-  --ephemeral --directory "$home/disposable" \
+expect_exit 2 "ephemeral with --dir" "$binary" ephemeral 3000 --dir "$home/disposable" \
   --api http://127.0.0.1:1 --startup-timeout 1 --shutdown-timeout 1
-for action in 3000 init url delete; do
-  expect_exit 2 "$action without --directory" "$binary" "$action" \
-    --api http://127.0.0.1:1 --startup-timeout 1 --shutdown-timeout 1
-done
+expect_exit 2 "up without --dir" "$binary" up 3000 --api http://127.0.0.1:1
+expect_exit 2 "init without --dir" "$binary" init --api http://127.0.0.1:1
+expect_exit 2 "url without --dir" "$binary" url
+expect_exit 2 "delete without --dir" "$binary" delete --api http://127.0.0.1:1
 
 # `url` on absent state: exit 3, empty stdout, a diagnostic on stderr, and the
 # directory must not be created (the command is read-only).
 url_dir="$home/absent-state"
 set +e
-stdout=$(run "$binary" url --directory "$url_dir" 2>"$home/url.err")
+stdout=$(run "$binary" url --dir "$url_dir" 2>"$home/url.err")
 code=$?
 set -e
 if [[ $code -ne 3 ]]; then

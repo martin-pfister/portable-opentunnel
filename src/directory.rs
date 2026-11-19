@@ -1,6 +1,6 @@
 //! Choosing and creating the state directory for each mode.
 //!
-//! * Reusable: `--directory` names the exact directory and is required.
+//! * Reusable: `--dir` names the exact directory and is required.
 //!   It is created when missing, privately and exclusively.
 //! * Ephemeral: always create a unique private directory under `$TMPDIR`
 //!   (falling back to the system temporary directory).
@@ -30,15 +30,6 @@ impl Selection<'_> {
             Self::Ephemeral => Mode::Ephemeral,
         }
     }
-}
-
-pub fn require_explicit(directory: Option<&Path>) -> AppResult<&Path> {
-    directory.ok_or_else(|| {
-        AppError::new(
-            2,
-            "--directory DIR is required unless forwarding with --ephemeral",
-        )
-    })
 }
 
 /// Makes a user-supplied path absolute against the current directory, without
@@ -164,13 +155,6 @@ mod tests {
         // A second run accepts the existing private directory.
         let again = prepare(Selection::Reusable(&path)).unwrap();
         assert_eq!(again, path);
-    }
-
-    #[test]
-    fn reusable_mode_requires_an_explicit_directory() {
-        let error = require_explicit(None).unwrap_err();
-        assert_eq!(error.code, 2);
-        assert!(error.message.contains("--directory"));
     }
 
     #[test]

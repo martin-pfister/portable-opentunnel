@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
-use crate::directory;
 use crate::error::{AppError, AppResult};
 
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -22,88 +21,103 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
         The identity and its random route are saved in the state directory, so the public HTTPS URL \
         stays the same between runs even when the local target changes.",
     after_help = "EXAMPLES:\n  \
-        portable-opentunnel 3000 --directory ./my-tunnel\n  \
-        portable-opentunnel 127.0.0.1:8080 --directory /shared/private/my-tunnel\n  \
-        portable-opentunnel 3000 --ephemeral\n  \
-        portable-opentunnel init --directory ./my-tunnel\n  \
-        portable-opentunnel url --directory ./my-tunnel\n  \
-        portable-opentunnel delete --directory ./my-tunnel\n\n\
+        portable-opentunnel ephemeral 3000\n  \
+        portable-opentunnel up 3000 --dir ./my-tunnel\n  \
+        portable-opentunnel init --dir ./my-tunnel\n  \
+        portable-opentunnel url --dir ./my-tunnel\n  \
+        portable-opentunnel delete --dir ./my-tunnel\n\n\
         EXIT STATUS:\n  \
         0 success; 1 operational failure; 2 invalid arguments; 3 no initialized identity;\n  \
         130 after SIGINT; 143 after SIGTERM"
 )]
 pub struct Cli {
-    #[command(flatten)]
-    pub common: CommonArgs,
-
     #[command(subcommand)]
-    pub command: Option<Command>,
-
-    /// Local target: a bare port means 127.0.0.1, or give host:port
-    #[arg(value_name = "TARGET")]
-    pub target: Option<String>,
+    pub command: Command,
 }
 
 #[derive(Debug, Args)]
-pub struct CommonArgs {
-    /// Exact state directory (required for reusable state)
-    #[arg(long, short = 'd', global = true, value_name = "DIR")]
-    pub directory: Option<PathBuf>,
+pub struct StateArgs {
+    /// Exact state directory
+    #[arg(long = "dir", value_name = "DIR")]
+    pub directory: PathBuf,
+}
 
-    /// Use a fresh temporary directory and try to delete the tunnel on exit
-    #[arg(long, global = true, conflicts_with = "directory")]
-    pub ephemeral: bool,
-
+#[derive(Debug, Args)]
+pub struct NetworkArgs {
     /// Extra CA certificate (PEM) to trust for the API and bridge
-    #[arg(long, global = true, value_name = "PEM")]
+    #[arg(long, value_name = "PEM")]
     pub ca_cert: Option<PathBuf>,
 
     /// Use another API endpoint (for local testing)
-    #[arg(long, global = true, hide = true, value_name = "URL")]
+    #[arg(long, hide = true, value_name = "URL", value_parser = parse_api)]
     pub api: Option<String>,
 
-    /// Total seconds to wait for provisioning and attachment
-    #[arg(long, global = true, value_name = "SECONDS", default_value_t = 600)]
+    /// Print more diagnostics (credentials are never printed)
+    #[arg(long, action = ArgAction::Count)]
+    pub verbose: u8,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub network: NetworkArgs,
+
+    /// Total seconds to wait for provisioning and, if forwarding, attachment
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_STARTUP_TIMEOUT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..))]
     pub startup_timeout: u64,
 
-    /// Seconds allowed for shutdown, remote deletion, and local cleanup
-    #[arg(long, global = true, value_name = "SECONDS", default_value_t = 15)]
-    pub shutdown_timeout: u64,
+    #[command(flatten)]
+    pub shutdown: ShutdownArgs,
+}
 
-    /// Print more diagnostics (credentials are never printed)
-    #[arg(long, global = true, action = ArgAction::Count)]
-    pub verbose: u8,
+#[derive(Debug, Args)]
+pub struct ShutdownArgs {
+    /// Seconds allowed for shutdown or deletion
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..))]
+    pub shutdown_timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ForwardArgs {
+    /// Local target: a bare port means 127.0.0.1, or give host:port
+    #[arg(value_name = "TARGET", value_parser = parse_target)]
+    pub target: Target,
+
+    #[command(flatten)]
+    pub run: RunArgs,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Forward in the foreground using a saved, reusable URL
+    Up {
+        #[command(flatten)]
+        state: StateArgs,
+        #[command(flatten)]
+        forward: ForwardArgs,
+    },
+    /// Forward with a temporary URL and try to delete it on exit
+    Ephemeral(ForwardArgs),
     /// Create or ensure the saved identity and print its URL without forwarding
-    Init,
+    Init {
+        #[command(flatten)]
+        state: StateArgs,
+        #[command(flatten)]
+        run: RunArgs,
+    },
     /// Print the saved URL, without any network access
-    Url,
+    Url(StateArgs),
     /// Delete a saved identity remotely and remove its state
-    Delete,
-}
-
-/// A fully validated invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    Forward(Target),
-    Init,
-    Url,
-    Delete,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Invocation {
-    pub action: Action,
-    pub directory: Option<PathBuf>,
-    pub ephemeral: bool,
-    pub ca_cert: Option<PathBuf>,
-    pub api: Option<String>,
-    pub startup_timeout: Duration,
-    pub shutdown_timeout: Duration,
-    pub verbose: u8,
+    Delete {
+        #[command(flatten)]
+        state: StateArgs,
+        #[command(flatten)]
+        network: NetworkArgs,
+        #[command(flatten)]
+        shutdown: ShutdownArgs,
+    },
 }
 
 /// The resolved local target: always `host:port` by the time it reaches the
@@ -224,121 +238,22 @@ fn parse_port(value: &str) -> AppResult<u16> {
     Ok(port)
 }
 
-impl Cli {
-    pub fn resolve(self) -> AppResult<Invocation> {
-        let common = self.common;
-
-        let action = match self.command {
-            Some(Command::Init) => {
-                if common.ephemeral {
-                    return Err(AppError::new(2, "init cannot be combined with --ephemeral"));
-                }
-                if self.target.is_some() {
-                    return Err(AppError::new(
-                        2,
-                        "init does not take a target; it only prepares the identity and route",
-                    ));
-                }
-                Action::Init
-            }
-            Some(Command::Url) => {
-                if common.ephemeral {
-                    return Err(AppError::new(2, "url cannot be combined with --ephemeral"));
-                }
-                if self.target.is_some() {
-                    return Err(AppError::new(2, "url does not take a target"));
-                }
-                Action::Url
-            }
-            Some(Command::Delete) => {
-                if common.ephemeral {
-                    return Err(AppError::new(
-                        2,
-                        "delete cannot be combined with --ephemeral; name the directory with --directory",
-                    ));
-                }
-                if self.target.is_some() {
-                    return Err(AppError::new(2, "delete does not take a target"));
-                }
-                Action::Delete
-            }
-            None => {
-                let target = self.target.ok_or_else(|| {
-                    AppError::new(
-                        2,
-                        "a local target is required: a port such as 3000, or host:port",
-                    )
-                })?;
-                Action::Forward(parse_target(&target)?)
-            }
-        };
-
-        if !common.ephemeral {
-            directory::require_explicit(common.directory.as_deref())?;
-        }
-
-        let startup_timeout = Duration::from_secs(common.startup_timeout);
-        if startup_timeout.is_zero() {
-            return Err(AppError::new(
-                2,
-                "--startup-timeout must be at least 1 second",
-            ));
-        }
-        let shutdown_timeout = Duration::from_secs(common.shutdown_timeout);
-        if shutdown_timeout.is_zero() {
-            return Err(AppError::new(
-                2,
-                "--shutdown-timeout must be at least 1 second",
-            ));
-        }
-
-        let api = match common.api {
-            Some(api) => {
-                let url = url::Url::parse(&api)
-                    .map_err(|error| AppError::new(2, format!("invalid --api '{api}': {error}")))?;
-                if !matches!(url.scheme(), "http" | "https") {
-                    return Err(AppError::new(
-                        2,
-                        format!("invalid --api '{api}': only http and https are supported"),
-                    ));
-                }
-                if url.host().is_none() {
-                    return Err(AppError::new(
-                        2,
-                        format!("invalid --api '{api}': the URL has no host"),
-                    ));
-                }
-                // The SDK joins absolute API paths onto the base, which
-                // discards any base path. Accepting one would silently point
-                // requests somewhere else, so require a bare origin.
-                if !matches!(url.path(), "" | "/")
-                    || url.query().is_some()
-                    || url.fragment().is_some()
-                {
-                    return Err(AppError::new(
-                        2,
-                        format!(
-                            "invalid --api '{api}': use an origin only, such as \
-                             http://127.0.0.1:8080, without a path, query, or fragment"
-                        ),
-                    ));
-                }
-                Some(api)
-            }
-            None => None,
-        };
-
-        Ok(Invocation {
-            action,
-            directory: common.directory,
-            ephemeral: common.ephemeral,
-            ca_cert: common.ca_cert,
-            api,
-            startup_timeout,
-            shutdown_timeout,
-            verbose: common.verbose,
-        })
+fn parse_api(api: &str) -> AppResult<String> {
+    let url = url::Url::parse(api).map_err(|error| AppError::new(2, error.to_string()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::new(2, "only http and https are supported"));
     }
+    if url.host().is_none() {
+        return Err(AppError::new(2, "the URL has no host"));
+    }
+    // The SDK joins absolute API paths onto the base, discarding any prefix.
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err(AppError::new(
+            2,
+            "use an origin only, such as http://127.0.0.1:8080, without a path, query, or fragment",
+        ));
+    }
+    Ok(api.to_owned())
 }
 
 #[cfg(test)]
@@ -352,19 +267,26 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    fn parse(args: &[&str]) -> Invocation {
-        Cli::try_parse_from(args).unwrap().resolve().unwrap()
+    fn parse_ephemeral(args: &[&str]) -> ForwardArgs {
+        let Command::Ephemeral(forward) = Cli::try_parse_from(args).unwrap().command else {
+            panic!("expected ephemeral");
+        };
+        forward
     }
 
     #[test]
     fn bare_port_targets_loopback() {
-        let invocation = parse(&["portable-opentunnel", "3000", "-d", "./state"]);
+        let cli = Cli::try_parse_from(["p", "up", "3000", "--dir", "./state"]).unwrap();
+        let Command::Up { state, forward } = cli.command else {
+            panic!("expected up");
+        };
+        assert_eq!(state.directory, PathBuf::from("./state"));
         assert_eq!(
-            invocation.action,
-            Action::Forward(Target {
+            forward.target,
+            Target {
                 host: "127.0.0.1".into(),
                 port: 3000
-            })
+            }
         );
     }
 
@@ -416,86 +338,60 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_uses_no_explicit_directory() {
-        let invocation = parse(&["portable-opentunnel", "3000", "--ephemeral"]);
-        assert!(invocation.ephemeral);
-        assert!(invocation.directory.is_none());
-    }
-
-    #[test]
-    fn subcommands_reject_incompatible_flags() {
-        for args in [
-            ["p", "init", "--ephemeral"],
-            ["p", "url", "--ephemeral"],
-            ["p", "delete", "--ephemeral"],
-        ] {
-            assert!(
-                Cli::try_parse_from(args).unwrap().resolve().is_err(),
-                "{args:?}"
-            );
-        }
-        // A subcommand takes no target, so clap rejects it while parsing.
-        for args in [
-            ["p", "init", "3000"],
-            ["p", "url", "3000"],
-            ["p", "delete", "3000"],
-        ] {
-            let error = Cli::try_parse_from(args).unwrap_err();
-            assert_eq!(
-                error.kind(),
-                clap::error::ErrorKind::UnknownArgument,
-                "{args:?}"
-            );
-            assert_ne!(error.exit_code(), 0, "{args:?}");
-        }
+    fn ephemeral_has_no_directory_option() {
+        let forward = parse_ephemeral(&["p", "ephemeral", "3000"]);
+        assert_eq!(forward.target.port, 3000);
+        let error =
+            Cli::try_parse_from(["p", "ephemeral", "3000", "--dir", "./state"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
     fn forwarding_requires_a_target() {
-        let error = Cli::try_parse_from(["portable-opentunnel"])
-            .unwrap()
-            .resolve()
-            .unwrap_err();
-        assert_eq!(error.code, 2);
+        for args in [&["p", "ephemeral"][..], &["p", "up", "--dir", "./state"]] {
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains("<TARGET>"), "{error}");
+        }
     }
 
     #[test]
     fn zero_timeouts_are_rejected() {
         for flag in ["--startup-timeout", "--shutdown-timeout"] {
-            let cli = Cli::try_parse_from(["p", "3000", "-d", "./state", flag, "0"]).unwrap();
-            let error = cli.resolve().unwrap_err();
-            assert_eq!(error.code, 2);
-            assert!(error.message.contains(flag), "{error}");
+            let error = Cli::try_parse_from(["p", "ephemeral", "3000", flag, "0"]).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains(flag), "{error}");
         }
     }
 
     #[test]
     fn timeouts_are_parsed() {
-        let invocation = parse(&[
-            "portable-opentunnel",
+        let forward = parse_ephemeral(&[
+            "p",
+            "ephemeral",
             "3000",
-            "-d",
-            "./state",
             "--startup-timeout",
             "30",
             "--shutdown-timeout",
             "5",
         ]);
-        assert_eq!(invocation.startup_timeout, Duration::from_secs(30));
-        assert_eq!(invocation.shutdown_timeout, Duration::from_secs(5));
+        assert_eq!(forward.run.startup_timeout, 30);
+        assert_eq!(forward.run.shutdown.shutdown_timeout, 5);
     }
 
     #[test]
     fn api_override_is_validated() {
         for api in ["http://127.0.0.1:1", "http://127.0.0.1:1/"] {
-            let invocation = parse(&["p", "3000", "-d", "./state", "--api", api]);
-            assert_eq!(invocation.api.as_deref(), Some(api));
+            let forward = parse_ephemeral(&["p", "ephemeral", "3000", "--api", api]);
+            assert_eq!(forward.run.network.api.as_deref(), Some(api));
         }
         for api in ["ftp://host", "not a url"] {
-            let cli = Cli::try_parse_from(["p", "3000", "-d", "./state", "--api", api]).unwrap();
-            let error = cli.resolve().unwrap_err();
-            assert_eq!(error.code, 2);
-            assert!(error.message.contains("invalid --api"), "{error}");
+            let error = Cli::try_parse_from(["p", "ephemeral", "3000", "--api", api]).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains("--api"), "{error}");
         }
     }
 
@@ -509,10 +405,9 @@ mod tests {
             "http://127.0.0.1:8080?x=1",
             "http://127.0.0.1:8080#frag",
         ] {
-            let cli = Cli::try_parse_from(["p", "3000", "-d", "./state", "--api", api]).unwrap();
-            let error = cli.resolve().unwrap_err();
-            assert_eq!(error.code, 2, "{api} should be rejected");
-            assert!(error.message.contains("origin only"), "{}", error.message);
+            let error = Cli::try_parse_from(["p", "ephemeral", "3000", "--api", api]).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{api} should be rejected");
+            assert!(error.to_string().contains("origin only"), "{error}");
         }
     }
 

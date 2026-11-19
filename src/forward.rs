@@ -210,7 +210,7 @@ impl Prepared {
             }
             Classification::Unrelated { reason } => {
                 return Err(AppError::fail(format!(
-                    "{reason}. Choose another --directory, or remove that content yourself"
+                    "{reason}. Choose another --dir, or remove that content yourself"
                 )));
             }
         };
@@ -728,7 +728,7 @@ mod tests {
             error.message
         );
         assert!(
-            error.message.contains("delete --directory"),
+            error.message.contains("delete --dir"),
             "the message must name the recovery command: {}",
             error.message
         );

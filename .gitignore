@@ -4,7 +4,7 @@
 
 # ---------------------------------------------------------------- credentials
 # State directories hold the SDK token, private key, certificate, and route.
-# Never commit state. Keep your chosen --directory outside the checkout or
+# Never commit state. Keep your chosen --dir outside the checkout or
 # ignore it explicitly; also guard the SDK profile against accidental staging.
 sdk/default/
 

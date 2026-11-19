@@ -605,7 +605,7 @@ fn profile(state: &Path) -> PathBuf {
 
 /// Runs `init` and returns its URL. Panics with the child's stderr on failure.
 fn init(scratch: &Scratch, api: &FakeApi, state: &Path, extra: &[&str]) -> String {
-    let mut args = vec!["init", "--directory", state.to_str().unwrap(), "--api"];
+    let mut args = vec!["init", "--dir", state.to_str().unwrap(), "--api"];
     let api_url = api.api_url();
     args.push(&api_url);
     args.extend_from_slice(extra);
@@ -631,7 +631,7 @@ fn spawn_forward(
     target: &str,
     extra: &[&str],
 ) -> Process {
-    let mut args = vec![target, "--directory", state.to_str().unwrap(), "--api"];
+    let mut args = vec!["up", target, "--dir", state.to_str().unwrap(), "--api"];
     let api_url = api.api_url();
     args.push(&api_url);
     args.extend_from_slice(extra);
@@ -640,7 +640,7 @@ fn spawn_forward(
 
 fn spawn_ephemeral(scratch: &Scratch, api: &FakeApi, target: &str, extra: &[&str]) -> Process {
     let api_url = api.api_url();
-    let mut args = vec![target, "--ephemeral", "--api", &api_url];
+    let mut args = vec!["ephemeral", target, "--api", &api_url];
     args.extend_from_slice(extra);
     Process::spawn(scratch, &args, &[])
 }
@@ -690,7 +690,7 @@ fn init_never_attaches_and_keeps_one_stable_url() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -711,7 +711,7 @@ fn init_never_attaches_and_keeps_one_stable_url() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -739,11 +739,7 @@ fn init_never_attaches_and_keeps_one_stable_url() {
     );
 
     // `url` is offline: no --api, so it cannot have contacted anything.
-    let mut url = Process::spawn(
-        &scratch,
-        &["url", "--directory", state.to_str().unwrap()],
-        &[],
-    );
+    let mut url = Process::spawn(&scratch, &["url", "--dir", state.to_str().unwrap()], &[]);
     url.expect_code(0, Duration::from_secs(10), "url after init")
         .expect("url should read the saved state");
     let printed = url.wait_line("https://", Duration::from_secs(5));
@@ -767,8 +763,9 @@ fn persistent_forward_serves_traffic_then_keeps_identity_on_sigterm() {
     let mut process = Process::spawn(
         &scratch,
         &[
+            "up",
             &target,
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -821,8 +818,9 @@ fn persistent_forward_serves_traffic_then_keeps_identity_on_sigterm() {
     let mut restart = Process::spawn(
         &scratch,
         &[
+            "up",
             &format!("127.0.0.1:{other_port}"),
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -901,7 +899,7 @@ fn delete_removes_a_complete_identity_and_accepts_404() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -915,11 +913,7 @@ fn delete_removes_a_complete_identity_and_accepts_404() {
     init.expect_code(0, Duration::from_secs(30), "init before delete")
         .expect("init should succeed");
 
-    let mut delete = Process::spawn(
-        &scratch,
-        &["delete", "--directory", state.to_str().unwrap()],
-        &[],
-    );
+    let mut delete = Process::spawn(&scratch, &["delete", "--dir", state.to_str().unwrap()], &[]);
     delete
         .expect_code(0, Duration::from_secs(25), "delete")
         .expect("delete should succeed");
@@ -933,7 +927,7 @@ fn delete_removes_a_complete_identity_and_accepts_404() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             second.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -950,7 +944,7 @@ fn delete_removes_a_complete_identity_and_accepts_404() {
 
     let mut delete = Process::spawn(
         &scratch,
-        &["delete", "--directory", second.to_str().unwrap()],
+        &["delete", "--dir", second.to_str().unwrap()],
         &[],
     );
     delete
@@ -978,7 +972,7 @@ fn delete_removes_a_pending_only_identity() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -1014,11 +1008,7 @@ fn delete_removes_a_pending_only_identity() {
     // The pending state is kept by the reusable run and must now be deletable.
     assert!(pending.exists(), "a reusable run keeps its pending state");
 
-    let mut delete = Process::spawn(
-        &scratch,
-        &["delete", "--directory", state.to_str().unwrap()],
-        &[],
-    );
+    let mut delete = Process::spawn(&scratch, &["delete", "--dir", state.to_str().unwrap()], &[]);
     delete
         .expect_code(0, Duration::from_secs(25), "delete pending identity")
         .expect("delete must handle pending-only state");
@@ -1048,7 +1038,7 @@ fn startup_timeout_and_signal_before_ready() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -1080,7 +1070,7 @@ fn startup_timeout_and_signal_before_ready() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             other.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -1125,7 +1115,7 @@ fn failed_deletion_preserves_credentials_and_prints_recovery() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -1141,11 +1131,7 @@ fn failed_deletion_preserves_credentials_and_prints_recovery() {
 
     api.change(|behaviour| behaviour.delete_status = Some(500));
 
-    let mut delete = Process::spawn(
-        &scratch,
-        &["delete", "--directory", state.to_str().unwrap()],
-        &[],
-    );
+    let mut delete = Process::spawn(&scratch, &["delete", "--dir", state.to_str().unwrap()], &[]);
     delete
         .expect_code(1, Duration::from_secs(25), "delete against a failing API")
         .expect("a failed deletion must exit 1");
@@ -1156,7 +1142,7 @@ fn failed_deletion_preserves_credentials_and_prints_recovery() {
         "the failure must say the credentials were kept: {stderr}"
     );
     assert!(
-        stderr.contains("portable-opentunnel delete --directory"),
+        stderr.contains("portable-opentunnel delete --dir"),
         "the failure must print the exact recovery command: {stderr}"
     );
     assert!(
@@ -1180,8 +1166,9 @@ fn sigint_exits_130_and_a_second_signal_forces_exit() {
     let mut process = Process::spawn(
         &scratch,
         &[
+            "up",
             backend.target().as_str(),
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -1207,8 +1194,9 @@ fn sigint_exits_130_and_a_second_signal_forces_exit() {
     let mut twice = Process::spawn(
         &scratch,
         &[
+            "up",
             backend.target().as_str(),
-            "--directory",
+            "--dir",
             other.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -1319,7 +1307,7 @@ fn unknown_profile_files_are_preserved_on_successful_delete() {
         &scratch,
         &[
             "init",
-            "--directory",
+            "--dir",
             state.to_str().unwrap(),
             "--api",
             &api.api_url(),
@@ -1338,11 +1326,7 @@ fn unknown_profile_files_are_preserved_on_successful_delete() {
     let stranger = profile.join("notes.txt");
     fs::write(&stranger, b"keep me\n").expect("writing an unrelated file");
 
-    let mut delete = Process::spawn(
-        &scratch,
-        &["delete", "--directory", state.to_str().unwrap()],
-        &[],
-    );
+    let mut delete = Process::spawn(&scratch, &["delete", "--dir", state.to_str().unwrap()], &[]);
     delete
         .expect_code(
             0,
@@ -1534,7 +1518,7 @@ fn https_and_wss_with_the_fixture_ca_forwards() {
     let ca_refs: Vec<&str> = ca.iter().map(String::as_str).collect();
 
     let target = backend.target();
-    let mut args = vec![target.as_str(), "--directory", state.to_str().unwrap()];
+    let mut args = vec!["up", target.as_str(), "--dir", state.to_str().unwrap()];
     let api_url = api.api_url();
     args.push("--api");
     args.push(&api_url);
@@ -1665,11 +1649,7 @@ fn sigkill_ephemeral_state_is_removable_by_explicit_delete() {
     assert_eq!(api.deletes(), 0, "SIGKILL cannot have deleted remotely");
 
     // ...and an explicit delete must remove both halves.
-    let mut delete = Process::spawn(
-        &scratch,
-        &["delete", "--directory", state.to_str().unwrap()],
-        &[],
-    );
+    let mut delete = Process::spawn(&scratch, &["delete", "--dir", state.to_str().unwrap()], &[]);
     delete
         .expect_code(0, Duration::from_secs(30), "delete abandoned ephemeral run")
         .expect("delete must accept an abandoned ephemeral directory");

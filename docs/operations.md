@@ -5,11 +5,10 @@ For command-line syntax and defaults, run `./portable-opentunnel --help`.
 
 ## Lifecycle and exit status
 
-- **Forwarding** holds the writer lock, provisions or reuses an identity, and
-  prints the URL once the bridge attaches. It runs until SIGINT, SIGTERM, or a
-  terminal bridge error. It does not start or health-check the target service.
+- **`up`** forwards in the foreground using a reusable identity.
+- **`ephemeral`** forwards with a new identity and attempts cleanup at exit.
 - **`init`** provisions or checks a reusable identity and prints its URL.
-  It does not attach a bridge and cannot be combined with `--ephemeral`.
+  It does not attach a bridge.
 - **`url`** is offline and read-only. It checks for completed state without a
   writer lock; it does not check whether the bridge is running. It prints
   nothing if initialization has not completed or the state is marked for
@@ -17,6 +16,10 @@ For command-line syntax and defaults, run `./portable-opentunnel --help`.
 - **`delete`** retires the registration and removes recognized local state.
   It refuses a live lock, corrupt state, or unrecognized directories; a
   missing directory is harmless.
+
+Both forwarding commands hold the writer lock, print the URL once the bridge
+attaches, and run until SIGINT, SIGTERM, or a terminal bridge error. They do
+not start or health-check the target service.
 
 `--startup-timeout` (default 600 seconds) sets **one** deadline across
 provisioning and attachment. Startup failure can still be followed by
@@ -40,12 +43,12 @@ signal determines the status. A second signal forces immediate exit.
 
 ## State and recovery
 
-Reusable forwarding, `init`, `url`, and `delete` require `--directory DIR`.
-The argument names the exact directory. Ephemeral forwarding does not accept
-`--directory`: it creates a fresh private directory under `$TMPDIR`, or
-`/tmp` when `TMPDIR` is unset or empty. Use `--verbose` to see the generated
-path on stderr. Keep reusable state out of version control and on a private
-filesystem with reliable `flock` semantics, including across nodes if shared.
+`up`, `init`, `url`, and `delete` require `--dir DIR`, which names the exact
+state directory. `ephemeral` creates a fresh private directory under
+`$TMPDIR`, or `/tmp` when `TMPDIR` is unset or empty. Use `--verbose` to see the
+generated path on stderr. Keep reusable state out of version control and on a
+private filesystem with reliable `flock` semantics, including across nodes if
+shared.
 
 ```text
 <state>/
@@ -62,7 +65,7 @@ swap, core dumps, or files and logs written by other programs.
 
 - **To keep the URL:** restart forwarding with the same reusable directory.
   An interrupted provision can resume using saved pending credentials.
-- **To retire the URL:** run `delete --directory DIR`. The API must confirm
+- **To retire the URL:** run `delete --dir DIR`. The API must confirm
   deletion or return 404 before local credentials are removed. If a timeout,
   transport error, or other API status prevents confirmation, the credentials
   stay in place. Retry with the same directory and CA settings. A 401/403
@@ -86,7 +89,7 @@ The same limitation applies if node-local storage disappears.
 The control-plane connections (API and bridge WebSocket) verify TLS using
 bundled Mozilla roots, the system store where available, and any extra PEM
 certificates. Pass `--ca-cert /path/to/ca.pem` or set `OPENTUNNEL_CA_CERT`;
-the flag wins. The PEM is checked before use. `url` ignores this setting
+the flag wins. The PEM is checked before use. `url` does not read CA settings
 because it does not connect. The visitor-facing tunnel certificate is
 separate from control-plane trust.
 

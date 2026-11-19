@@ -298,7 +298,7 @@ fn help_and_version_succeed_without_creating_state() {
 fn invalid_ports_are_rejected_with_exit_2() {
     let scratch = Scratch::new();
     for target in ["0", "65536", "99999", "-1", "abc", "3000abc", "  "] {
-        let output = scratch.run(&[target]);
+        let output = scratch.run(&["ephemeral", target, "--api", FIXTURE_API]);
         assert_code(&output, 2, &format!("target {target:?}"));
         assert!(
             !stdout(&output).is_empty() || !stderr(&output).is_empty(),
@@ -328,7 +328,7 @@ fn malformed_hosts_and_ipv6_are_rejected_with_exit_2() {
         "bad host:3000",
         "exa/mple:3000",
     ] {
-        let output = scratch.run(&[target]);
+        let output = scratch.run(&["ephemeral", target, "--api", FIXTURE_API]);
         assert_code(&output, 2, &format!("target {target:?}"));
     }
     scratch.assert_created_nothing();
@@ -339,21 +339,49 @@ fn incompatible_flag_combinations_are_rejected_with_exit_2() {
     let scratch = Scratch::new();
 
     let cases: &[(&[&str], &str)] = &[
-        (&["init", "--ephemeral"], "init with --ephemeral"),
-        (&["url", "--ephemeral"], "url with --ephemeral"),
-        (&["delete", "--ephemeral"], "delete with --ephemeral"),
         (&["init", "3000"], "init with a target"),
         (&["url", "3000"], "url with a target"),
         (&["delete", "3000"], "delete with a target"),
         (
-            &["3000", "-d", "./state", "--startup-timeout", "0"],
+            &[
+                "ephemeral",
+                "3000",
+                "--startup-timeout",
+                "0",
+                "--api",
+                FIXTURE_API,
+            ],
             "zero startup timeout",
         ),
         (
-            &["3000", "-d", "./state", "--shutdown-timeout", "0"],
+            &[
+                "ephemeral",
+                "3000",
+                "--shutdown-timeout",
+                "0",
+                "--api",
+                FIXTURE_API,
+            ],
             "zero shutdown timeout",
         ),
-        (&["3000", "--no-such-flag"], "unknown flag"),
+        (
+            &["url", "--dir", "./state", "--ca-cert", "ca.pem"],
+            "url with a network option",
+        ),
+        (
+            &["delete", "--dir", "./state", "--startup-timeout", "1"],
+            "delete with a startup option",
+        ),
+        (
+            &["url", "--directory", "./state"],
+            "url with the old long directory option",
+        ),
+        (
+            &["url", "-d", "./state"],
+            "url with the old short directory option",
+        ),
+        (&["3000"], "target without a command"),
+        (&["ephemeral", "3000", "--no-such-flag"], "unknown flag"),
         (&[], "no arguments"),
     ];
 
@@ -370,18 +398,26 @@ fn incompatible_flag_combinations_are_rejected_with_exit_2() {
 fn the_api_override_must_be_a_bare_origin() {
     let scratch = Scratch::new();
     // The SDK joins absolute API paths onto the base, which discards a base
-    // path; accepting one would silently redirect requests. `url` is used
-    // because it validates arguments before reading any state.
+    // path; accepting one would silently redirect requests.
     for api in [
-        "ftp://example.test",
+        "ftp://127.0.0.1:1",
         "not a url",
         "http://127.0.0.1:8080/prefix",
         "http://127.0.0.1:8080/?query=1",
         "file:///tmp/socket",
     ] {
-        let output = scratch.run(&["url", "-d", "./state", "--api", api]);
+        let output = scratch.run(&[
+            "ephemeral",
+            "3000",
+            "--api",
+            api,
+            "--startup-timeout",
+            "1",
+            "--shutdown-timeout",
+            "1",
+        ]);
         assert_code(&output, 2, &format!("--api {api:?}"));
-        assert!(stderr(&output).contains("invalid --api"));
+        assert!(stderr(&output).contains("--api"));
     }
     scratch.assert_created_nothing();
 }
@@ -389,20 +425,17 @@ fn the_api_override_must_be_a_bare_origin() {
 #[test]
 fn reusable_forwarding_and_subcommands_require_a_directory() {
     let scratch = Scratch::new();
-    for action in ["3000", "init", "url", "delete"] {
-        let output = scratch.run(&[
-            action,
-            "--api",
-            FIXTURE_API,
-            "--startup-timeout",
-            "1",
-            "--shutdown-timeout",
-            "1",
-        ]);
-        assert_code(&output, 2, action);
+    for args in [
+        &["up", "3000", "--api", FIXTURE_API][..],
+        &["init", "--api", FIXTURE_API],
+        &["url"],
+        &["delete", "--api", FIXTURE_API],
+    ] {
+        let output = scratch.run(args);
+        assert_code(&output, 2, args[0]);
         assert!(stdout(&output).is_empty());
         assert!(
-            stderr(&output).contains("--directory DIR is required"),
+            stderr(&output).contains("--dir <DIR>"),
             "{}",
             stderr(&output)
         );
@@ -414,9 +447,9 @@ fn reusable_forwarding_and_subcommands_require_a_directory() {
 fn ephemeral_forwarding_rejects_an_explicit_directory() {
     let scratch = Scratch::new();
     let output = scratch.run(&[
+        "ephemeral",
         "3000",
-        "--ephemeral",
-        "--directory",
+        "--dir",
         "./disposable",
         "--api",
         FIXTURE_API,
@@ -425,10 +458,9 @@ fn ephemeral_forwarding_rejects_an_explicit_directory() {
         "--shutdown-timeout",
         "1",
     ]);
-    assert_code(&output, 2, "ephemeral forwarding with --directory");
+    assert_code(&output, 2, "ephemeral forwarding with --dir");
     assert!(stdout(&output).is_empty());
-    assert!(stderr(&output).contains("--ephemeral"));
-    assert!(stderr(&output).contains("--directory"));
+    assert!(stderr(&output).contains("--dir"));
     scratch.assert_created_nothing();
 }
 
@@ -441,7 +473,7 @@ fn url_missing_directory_exits_3_and_creates_nothing() {
     let scratch = Scratch::new();
     let state = scratch.path("absent");
 
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 3, "url on a missing directory");
     assert!(
         stdout(&output).is_empty(),
@@ -463,7 +495,7 @@ fn url_prints_the_saved_url_without_reading_credentials() {
     let state = scratch.cwd().join("state");
     initialized(&state, "abc123", "abc.opentunnel.xyz");
 
-    let output = scratch.run(&["url", "--directory", "./state"]);
+    let output = scratch.run(&["url", "--dir", "./state"]);
     assert_code(&output, 0, "url on an initialized directory");
     assert_eq!(
         stdout(&output).trim_end(),
@@ -484,7 +516,7 @@ fn url_prints_the_bare_hostname_for_the_root_route() {
     let state = scratch.path("state");
     initialized(&state, "@", "abc.opentunnel.xyz");
 
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 0, "url with a root route");
     assert_eq!(stdout(&output).trim_end(), "https://abc.opentunnel.xyz");
 }
@@ -505,7 +537,7 @@ fn url_succeeds_when_the_token_is_unreadable() {
         return;
     }
 
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 0, "url must not read the token");
     assert_eq!(
         stdout(&output).trim_end(),
@@ -520,7 +552,7 @@ fn url_metadata_without_a_completed_identity_exits_3() {
     let state = scratch.path("state");
     metadata_only(&state, "abc123");
 
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 3, "url on metadata-only state");
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("No tunnel initialized in"));
@@ -536,7 +568,7 @@ fn url_corrupt_metadata_exits_1() {
     private_dir(&state);
     write_private(&state.join("wrapper.json"), "{not json");
 
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 1, "url on corrupt metadata");
     assert!(
         stdout(&output).is_empty(),
@@ -555,7 +587,7 @@ fn url_ignores_wrapper_temporary_residue_and_stays_read_only() {
     let residue = state.join("wrapper.json.tmp-4242-abcdef");
     write_private(&residue, "{}\n");
 
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 3, "url with only wrapper residue");
     assert!(stdout(&output).is_empty());
     assert!(
@@ -572,7 +604,7 @@ fn url_rejects_a_symlinked_state_directory() {
     let link = scratch.path("link");
     std::os::unix::fs::symlink(&real, &link).expect("creating a symlink");
 
-    let output = scratch.run(&["url", "--directory", link.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", link.to_str().unwrap()]);
     assert_code(&output, 1, "url on a symlinked directory");
     assert!(
         stderr(&output).contains("symlink"),
@@ -590,7 +622,7 @@ fn url_tolerates_unrelated_entries_in_the_state_root() {
     // complete identity from a read-only lookup.
     write_private(&state.join("notes.txt"), "mine\n");
 
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 0, "url with an unrelated file present");
     assert_eq!(
         stdout(&output).trim_end(),
@@ -630,7 +662,7 @@ fn url_works_while_the_writer_lock_is_held() {
 
     // `url` is read-only and must not acquire the writer lock, so a running
     // tunnel cannot make it fail.
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 0, "url while the lock is held");
     assert_eq!(
         stdout(&output).trim_end(),
@@ -647,7 +679,7 @@ fn delete_refuses_live_state_before_contacting_the_api() {
 
     // Refusal must happen on the lock, before the recorded endpoint is used,
     // so this stays offline even though the fixture names an API.
-    let output = scratch.run(&["delete", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["delete", "--dir", state.to_str().unwrap()]);
     assert_code(&output, 1, "delete while the lock is held");
     assert!(
         stderr(&output).contains("holds the lock"),
@@ -676,8 +708,9 @@ fn forward_refuses_a_group_accessible_state_directory() {
     // regression cannot reach the hosted service; the mode check must fail
     // first, leaving no metadata and no SDK files behind.
     let output = scratch.run(&[
+        "up",
         "3000",
-        "--directory",
+        "--dir",
         state.to_str().unwrap(),
         "--api",
         "http://127.0.0.1:1",
@@ -708,8 +741,9 @@ fn forward_refuses_a_symlinked_state_directory() {
     std::os::unix::fs::symlink(&real, &link).expect("creating a symlink");
 
     let output = scratch.run(&[
+        "up",
         "3000",
-        "--directory",
+        "--dir",
         link.to_str().unwrap(),
         "--api",
         "http://127.0.0.1:1",
@@ -736,8 +770,9 @@ fn forward_refuses_an_unrelated_nonempty_directory() {
     write_private(&state.join("notes.txt"), "mine\n");
 
     let output = scratch.run(&[
+        "up",
         "3000",
-        "--directory",
+        "--dir",
         state.to_str().unwrap(),
         "--api",
         "http://127.0.0.1:1",
