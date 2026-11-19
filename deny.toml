@@ -38,8 +38,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = false
 highlight = "all"
-# No TLS stack other than rustls: a static musl binary cannot use OpenSSL, and
-# the plan requires never disabling certificate verification.
+# Use rustls for TLS; keep OpenSSL and native-tls out of the static musl build.
 deny = [
     { crate = "openssl", use-instead = "rustls" },
     { crate = "openssl-sys", use-instead = "rustls" },

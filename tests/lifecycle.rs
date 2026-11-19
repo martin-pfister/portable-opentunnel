@@ -1368,7 +1368,7 @@ fn unknown_profile_files_are_preserved_on_successful_delete() {
         !state.join("wrapper.json").exists(),
         "owned wrapper metadata must still be removed"
     );
-    // The plan requires the retention to be reported, not silently ignored.
+    // Retention must be reported, not silently ignored.
     let stderr = delete.stderr();
     assert!(
         stderr.contains("retain"),

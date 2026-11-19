@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 
-/// The variables the pinned SDK actually honors. Documented as such in the
-/// README; the SDK does not read `OPENTUNNEL_API`.
+/// Environment fallback for the extra control-plane CA file.
 pub const CA_ENV: &str = "OPENTUNNEL_CA_CERT";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,19 +22,12 @@ pub struct Trust {
 impl Trust {
     /// Resolves the CA setting for a new client.
     ///
-    /// `cli` comes from `--ca-cert`. When it is absent the SDK reads
-    /// `OPENTUNNEL_CA_CERT` itself, so this returns `None` and the
-    /// environment keeps working. A file named explicitly on the command line
-    /// is checked up front, because a silent fallback to the public roots
-    /// would hide a typo until certificate validation failed.
-    /// Resolves the CA setting for a new client.
-    ///
     /// `cli` comes from `--ca-cert`. When it is absent the SDK would read
     /// `OPENTUNNEL_CA_CERT` itself, but it *silently ignores* a file it cannot
     /// read or that holds no certificates, so the variable is resolved and
     /// validated here as well and then passed to the SDK explicitly. Either
     /// way a bad file becomes a clear startup error instead of an opaque TLS
-    /// failure later (audit §6.3).
+    /// failure later.
     pub fn resolve(cli: Option<PathBuf>) -> AppResult<Self> {
         let chosen = match cli {
             Some(path) => Some(path),
@@ -52,7 +44,7 @@ impl Trust {
     /// The SDK logs and ignores an unreadable or empty CA file, then continues
     /// with the bundled and OS roots, so a typo only shows up later as an
     /// opaque TLS failure. Validating here turns that into a clear startup
-    /// error (audit §6.3).
+    /// error.
     pub fn validate(path: &Path) -> AppResult<()> {
         let metadata = std::fs::symlink_metadata(path).map_err(|error| {
             AppError::fail(format!("CA certificate {}: {error}", path.display()))

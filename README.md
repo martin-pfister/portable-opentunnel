@@ -77,6 +77,6 @@ is shared by provisioning and attachment.
   TLS, proxies, and static binary limitations.
 - [Slurm example](docs/slurm.md): batch script and signal handling.
 - [Build and CI](docs/ci.md): source build, checks, and artifact validation.
-- [SDK audit](SDK-AUDIT.md) and [implementation plan](PLAN.md) for maintainers.
+- [SDK upgrade checklist](docs/sdk-upgrades.md) for maintainers.
 
 MIT licensed. See [LICENSE](LICENSE).

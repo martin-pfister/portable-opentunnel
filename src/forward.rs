@@ -605,7 +605,7 @@ enum Supervised {
 ///
 /// The current value is read *before* awaiting `changed()`: a freshly cloned
 /// receiver marks the current value as seen, so `changed()` would never fire
-/// for a tunnel that had already stopped (audit §5.2).
+/// for a tunnel that had already stopped. See `docs/sdk-upgrades.md`.
 async fn supervise(tunnel: &Tunnel, listener: &mut Signals) -> Supervised {
     let mut status = tunnel.status_watch();
     loop {
