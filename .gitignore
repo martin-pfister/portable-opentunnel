@@ -1,0 +1,31 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# ---------------------------------------------------------------- credentials
+# State directories hold the SDK token, private key, certificate, and route.
+# Never commit them. The default directory is covered here; a directory chosen
+# with --directory is up to you, which is deliberate: an unexpectedly
+# untracked `wrapper.json` or `token` file should be *visible* in `git status`
+# for review, not silently ignored by a broad pattern.
+.portable-opentunnel/
+sdk/default/
+
+# ---------------------------------------------------------- build products
+/.ci-out/
+/dist/
+__pycache__/
+*.pyc
+
+# ------------------------------------------------------------- local config
+.env
+.env.*
+!.env.example
+# Developer-local agent/sandbox policy. Machine-specific; never committed.
+/.opencode/sandbox.json
+
+# ------------------------------------------------------- editors and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

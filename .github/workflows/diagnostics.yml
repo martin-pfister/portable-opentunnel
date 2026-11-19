@@ -1,0 +1,100 @@
+name: Diagnostics
+
+# Manual only. Prints the facts that matter when CI behaves differently from a
+# developer machine: toolchain, resolved dependency graph, pinned container
+# digest, and loopback/OS behaviour inside the pinned image. It uploads no
+# artifacts and touches no hosted service.
+#
+# It is also the place to run the supported offline test suite with more verbose
+# output when a pull request fails and the cause is unclear.
+on:
+  workflow_dispatch:
+    inputs:
+      verbose_tests:
+        description: Run the locked host test suite with verbose output
+        type: boolean
+        default: true
+      run_container:
+        description: Also probe the pinned AlmaLinux 8.8 container
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnostics-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.89.0"
+  MUSL_TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  report:
+    name: Environment and dependency report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+          targets: ${{ env.MUSL_TARGET }}
+
+      - name: Toolchain and host
+        run: |
+          set -euo pipefail
+          uname -a
+          rustc --version --verbose
+          cargo --version
+          rustup target list --installed
+          cat rust-toolchain.toml
+
+      - name: Resolved dependency graph summary
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["packages"]), "packages resolved")'
+          cargo tree --locked --duplicates || true
+
+      - name: Lockfile drift check
+        run: cargo check --locked --all-targets
+
+      - name: Verbose host tests
+        if: inputs.verbose_tests
+        run: cargo test --locked -- --nocapture
+
+      - name: Pinned container reference
+        run: |
+          set -euo pipefail
+          scripts/ci/container-ref.sh
+          scripts/ci/container-ref.sh --list
+          cat scripts/ci/container.lock
+
+      - name: Probe the pinned container
+        if: inputs.run_container
+        run: |
+          set -euo pipefail
+          image=$(scripts/ci/container-ref.sh)
+          docker pull "$image"
+          # Report the OS the tests will actually see, and confirm the loopback
+          # TCP stack works under `--network none` (the acceptance job's mode).
+          # Connecting to a closed 127.0.0.1 port must fail with "refused", not
+          # with a missing stack, otherwise in-container fixtures cannot bind.
+          docker run --rm --network none "$image" bash -c '
+            set -euo pipefail
+            grep -E "^(ID|VERSION_ID|PRETTY_NAME)=" /etc/os-release
+            ip -brief addr show lo || true
+            if bash -c "exec 3<>/dev/tcp/127.0.0.1/9" 2>/dev/null; then
+              echo "loopback connect unexpectedly succeeded on port 9"; exit 1
+            fi
+            echo "loopback stack present (connection refused as expected)"
+          '

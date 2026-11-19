@@ -1,0 +1,101 @@
+# Dependency license, advisory, ban, and source policy.
+#
+# Run locally:   cargo deny --all-features check
+# In CI:         the `dependencies` job in .github/workflows/ci.yml
+#
+# cargo-deny version: 0.21.0 (see .github/workflows/ci.yml and README.md).
+#
+# Provenance note: the allowlist below was enumerated from `cargo metadata` on
+# the committed `Cargo.lock`, so it names crates that actually resolve rather
+# than guesses. Keep it in step with the lockfile: adding a dependency with a
+# license outside this list must be a deliberate, reviewed edit.
+# Every entry below is a license this project is willing to ship.
+#
+# `cargo deny check licenses` output is the authority on what is actually in the
+# tree. Review any new entry rather than widening this list silently.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+# Vulnerabilities and unsoundness always fail. Unmaintained crates fail only
+# when they are a direct dependency of this workspace, since transitive
+# unmaintained crates are the upstream SDK's decision and are reviewed on
+# SDK upgrades instead.
+unmaintained = "workspace"
+unsound = "workspace"
+yanked = "deny"
+ignore = []
+
+[bans]
+# Duplicate versions are a warning, not a failure: the pinned SDK's tree is not
+# ours to deduplicate, and blocking CI on it would not improve security.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = false
+highlight = "all"
+# No TLS stack other than rustls: a static musl binary cannot use OpenSSL, and
+# the plan requires never disabling certificate verification.
+deny = [
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+    { crate = "native-tls", use-instead = "rustls" },
+    { crate = "libssh2-sys", reason = "not needed by a tunnel client" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Both spellings of the crates.io index: the git index URL and the sparse
+# protocol URL modern Cargo uses. Listing both avoids a spurious failure
+# depending on which protocol resolved the dependency.
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+]
+allow-git = []
+unused-allowed-source = "allow"
+
+[licenses]
+confidence-threshold = 0.93
+# Check dev-dependencies too: test-only crates are still shipped in the repo and
+# are reviewed like any other dependency.
+include-dev = true
+include-build = true
+# The repository itself is MIT OR Apache-2.0 (MIT chosen for distribution).
+private = { ignore = true }
+# Derived from `cargo metadata` on the committed lockfile, not guessed. The
+# observed set is: MIT, Apache-2.0, Unicode-3.0, ISC, BSD-3-Clause,
+# CDLA-Permissive-2.0, Unlicense, and Apache-2.0 WITH LLVM-exception.
+# One dual-licensed crate (r-efi, which offers LGPL-2.1-or-later) is a UEFI-only
+# target dependency; `[graph] targets` below restricts to Linux, so it is not in
+# the checked graph and needs no exception.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    # Mozilla root certificate bundle data, used by webpki-root-certs.
+    "CDLA-Permissive-2.0",
+]
+# Add crate-specific exceptions here rather than widening `allow`. The exception
+# table accepts only `crate` and `allow`; put the justification in a comment.
+# Empty today: every license in the graph is in the allowlist above.
+exceptions = []
+unused-allowed-license = "allow"
+
+# Some crates ship a license file that does not match their declared SPDX
+# expression exactly. cargo-deny prints the file hash it expects, so a
+# clarification is added with that hash only after reading the file.
+clarify = []

@@ -1,0 +1,59 @@
+[package]
+name = "portable-opentunnel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Expose one local service through OpenTunnel from a foreground process"
+repository = "https://github.com/martin-pfister/portable-opentunnel"
+readme = "README.md"
+
+[dependencies]
+opentunnel = "=0.6.2"
+clap = { version = "4.5.51", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "macros",
+    "signal",
+] }
+url = "2.5.7"
+libc = "0.2.177"
+tracing = "0.1.44"
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = [
+    "ring",
+    "pem",
+    "x509-parser",
+] }
+rustls = { version = "0.23.46", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3.34"
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "http2",
+    "json",
+    "rustls-no-provider",
+] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+hex = "0.4.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
