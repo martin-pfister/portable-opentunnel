@@ -8,10 +8,10 @@ OpenTunnel CLI. It is designed for environments such as cluster batch jobs.
 
 ## Get the binary
 
-On the [CI page](https://github.com/martin-pfister/portable-opentunnel/actions/workflows/ci.yml),
-open a successful **push to `main`** and download the `portable-opentunnel-<sha>`
-artifact. Artifacts expire after 30 days. Unzip the download, then run these
-commands in the extracted directory:
+From the [latest GitHub Release](https://github.com/martin-pfister/portable-opentunnel/releases/latest),
+download the Linux x86-64 `.tar.gz` and its `.tar.gz.sha256` checksum into the
+same directory. Every successful push to `main` gets an automated release
+named `build-N`. Verify and extract the download:
 
 ```sh
 sha256sum -c portable-opentunnel-*-x86_64-unknown-linux-musl.tar.gz.sha256 &&

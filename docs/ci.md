@@ -8,8 +8,8 @@ See the [workflow runs](https://github.com/martin-pfister/portable-opentunnel/ac
 for current status. The pinned AlmaLinux 8.8 container exercises the actual
 release executable as an unprivileged user.
 
-Nothing here contacts the hosted OpenTunnel service. No workflow requires
-credentials, and no workflow produces tunnel identities.
+Nothing here contacts the hosted OpenTunnel service, requires its credentials,
+or produces tunnel identities.
 
 ## Build from source
 
@@ -71,14 +71,10 @@ Before updating the pinned OpenTunnel SDK, repeat the
 | Diagnostics | `.github/workflows/diagnostics.yml` | manual dispatch only |
 
 There is no `pull_request_target` anywhere. Pull request code never receives
-secrets or a writable token. The workflow declares `contents: read`, and no job
-declares its own `permissions:` block, so every job runs with exactly that.
-
-Worth stating explicitly because it is easy to assume otherwise: a job-level
-`permissions:` block in GitHub Actions **replaces** the top-level one rather than
-being intersected with it. The guarantee here comes from the current
-configuration having no job-level blocks, not from the top level being an
-enforced ceiling. Any future job must not add a broader block.
+secrets or a writable token. Build and test jobs inherit `contents: read`.
+Only the publishing job gets `contents: write`; it runs after acceptance on
+pushes to `main` only and does not check out or execute repository code. It
+uses the built-in `GITHUB_TOKEN`, not a personal access token.
 
 ## CI jobs
 
@@ -237,22 +233,29 @@ Limits, restated every run in the output:
 A pass therefore means "no unexpected persistent change was found in the
 monitored paths", not "the program provably wrote nowhere else".
 
-### Release artifact on `main`
+### Automatic releases on `main`
 
-Only on a push to `main`, after acceptance passes:
+Only on a push to `main`, after acceptance passes, `package-artifact.sh`
+packages the exact tested binary. It re-checks static linkage and produces:
 
-- `scripts/ci/package-artifact.sh` produces:
-  - `portable-opentunnel-<version>-x86_64-unknown-linux-musl.tar.gz`,
-  - a `.tar.gz.sha256` checksum,
-  - a `.metadata.json` with version, target triple, commit SHA, run id/attempt,
-    and the real byte size;
-- `actions/upload-artifact` uploads them as `portable-opentunnel-<sha>` with
-  `if-no-files-found: error`.
+- `portable-opentunnel-build-<number>-x86_64-unknown-linux-musl.tar.gz`;
+- a `.tar.gz.sha256` checksum;
+- a `.metadata.json` with build label, target triple, commit SHA, run ID and
+  attempt, and binary size.
 
-Packaging re-checks static linkage, so a dynamic binary can never be published
-even if an earlier step were bypassed.
+The publishing job downloads that upload by artifact ID, verifies the checksum
+and metadata, and tags the accepted commit as `build-<number>`. It publishes the
+[GitHub Release](https://github.com/martin-pfister/portable-opentunnel/releases)
+only after all assets are uploaded. The temporary Actions artifact expires
+after 30 days; the release and its assets are not subject to that retention.
 
-The green run produced one:
+The number comes from `github.run_number`. Gaps are normal: other CI events and
+failed runs also consume numbers. No one needs to create tags or bump the
+unchanged Cargo version. A rerun uses the same tag; it can finish a draft but
+does not replace a published release. Older builds that finish late do not
+replace a newer numbered release as Latest.
+
+An earlier CI run, before automatic releases, produced this Actions artifact:
 
 | | |
 | --- | --- |
@@ -260,9 +263,6 @@ The green run produced one:
 | Artifact | [14560394278](https://github.com/martin-pfister/portable-opentunnel/actions/runs/44585384660/artifacts/14560394278) |
 | Archive size | 2,562,287 bytes |
 | Binary inside | 5,358,368 bytes (CI build) |
-
-Artifacts expire (`retention-days: 30`). There are **no** GitHub Release assets
-yet; durable release publishing on version tags is a separate decision.
 
 The CI binary and a local release build differ by a few kilobytes (5,358,368 vs
 5,382,952 bytes). The exact cause of the size difference has not been isolated.
@@ -371,6 +371,7 @@ reviewability:
 | --- | --- | --- |
 | `actions/checkout` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | `v7.0.1` |
 | `actions/upload-artifact` | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` | `v7.0.2` |
+| `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | `v8.0.2` |
 | `dtolnay/rust-toolchain` | `683b588c487a69d01f6c6ddf40f036ff682cc2c8` | `v1` |
 | `Swatinem/rust-cache` | `d1527c8f67ef9af357290475d4af4b0fab8f12e0` | `v2.9.3` |
 | `taiki-e/install-action` | `75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f` | `v2.90.6` |

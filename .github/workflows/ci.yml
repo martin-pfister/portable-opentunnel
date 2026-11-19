@@ -1,19 +1,16 @@
 name: CI
 
-# Triggers: every pull request, every push to main. On a push to main this is
-# configured to produce a downloadable static executable, gated on the format,
-# clippy, dependency, and AlmaLinux acceptance jobs below.
+# Every push to main publishes a numbered GitHub Release once format, Clippy,
+# dependency, and AlmaLinux acceptance checks pass.
 #
 # Security posture:
 #   - No `pull_request_target`. Pull request code never sees secrets.
-#   - The workflow sets `contents: read` for every job. No job widens it.
-#     (Note: GitHub does let a job-level `permissions:` block replace the
-#     top-level one, so this is a property of the current configuration, not
-#     an enforced ceiling. Keep job-level blocks absent or read-only.)
+#   - Build and test jobs have `contents: read`. Only the main-push publishing
+#     job has `contents: write`; it does not check out or run repository code.
 #   - Every third-party action is pinned to a commit SHA with the release tag in
 #     a comment. Renovate/Dependabot may update the SHA, not a floating tag.
 #   - The acceptance container is referenced by manifest digest, never by tag.
-#   - No job contacts the hosted OpenTunnel service and no job needs credentials.
+#   - No job contacts the hosted OpenTunnel service or needs its credentials.
 on:
   pull_request:
   push:
@@ -24,7 +21,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Supersede stale PR checks, but don't drop queued main pushes.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -117,6 +115,8 @@ jobs:
     # can upload a release artifact, so depending on `dependencies` as well as
     # `quality` keeps a license/advisory failure from ever producing one.
     needs: [quality, dependencies]
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -231,13 +231,95 @@ jobs:
           scripts/ci/package-artifact.sh \
             --binary "target/$MUSL_TARGET/release/portable-opentunnel" \
             --target "$MUSL_TARGET" \
-            --outdir .ci-out/dist
+            --outdir .ci-out/dist \
+            --version "build-$GITHUB_RUN_NUMBER"
 
       - name: Upload release artifact
+        id: upload
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: portable-opentunnel-${{ github.sha }}
+          name: portable-opentunnel-build-${{ github.run_number }}-attempt-${{ github.run_attempt }}
           path: .ci-out/dist/*
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish main build to GitHub Releases
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    # Publish one at a time so an older build cannot race a newer one for Latest.
+    concurrency:
+      group: portable-opentunnel-publish-main
+      queue: max
+    steps:
+      - name: Download the accepted package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.acceptance.outputs.artifact-id }}
+          # A retry of only this job may use an artifact from an earlier attempt.
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          path: ${{ runner.temp }}/release
+
+      - name: Publish the numbered release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/release"
+          tag="build-$GITHUB_RUN_NUMBER"
+          stem="portable-opentunnel-$tag-$MUSL_TARGET"
+          archive="$stem.tar.gz"
+          checksum="$archive.sha256"
+          metadata="$stem.metadata.json"
+          checksum_line=$(sha256sum "$archive")
+          printf '%s\n' "$checksum_line" | cmp - "$checksum"
+          jq -e --arg tag "$tag" --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
+            --arg target "$MUSL_TARGET" --arg archive "$archive" --arg digest "${checksum_line%% *}" \
+            '.version == $tag and .commit == $sha and .run_id == $run
+             and .target == $target and .archive == $archive
+             and .archive_sha256 == $digest and .linked == "static"' \
+            "$metadata" >/dev/null
+
+          # Never publish against a pre-existing tag that points elsewhere.
+          if ! tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha'); then
+            tag_sha=$(gh api "repos/$GH_REPO/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" --jq '.object.sha')
+          fi
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "$tag points to $tag_sha, not the accepted commit $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          if draft=$(gh release view "$tag" --json isDraft --jq '.isDraft'); then
+            if [[ "$draft" == false ]]; then
+              echo "$tag is already published; leaving it unchanged."
+              exit 0
+            fi
+          else
+            run_url="$GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
+            gh release create "$tag" --verify-tag --draft --title "$tag" \
+              --notes "Automated build of \`$GITHUB_SHA\`. [CI and acceptance results]($run_url)."
+          fi
+          # Retry incomplete uploads only on a draft. Published assets are never replaced.
+          gh release upload "$tag" --clobber "$archive" "$checksum" "$metadata"
+
+          if ! latest=$(gh api "repos/$GH_REPO/releases/latest" --jq '.tag_name' 2>&1); then
+            if [[ "$latest" != *"(HTTP 404)"* ]]; then
+              printf '%s\n' "$latest" >&2
+              exit 1
+            fi
+            latest=
+          fi
+          make_latest=true
+          if [[ "$latest" =~ ^build-([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] > GITHUB_RUN_NUMBER )); then
+            make_latest=false
+          fi
+          gh release edit "$tag" --draft=false --latest="$make_latest"
