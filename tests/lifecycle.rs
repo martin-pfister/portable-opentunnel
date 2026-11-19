@@ -1433,14 +1433,87 @@ fn signal_during_create_response_still_saves_pending_and_deletes() {
     );
 }
 
-/// The startup deadline covers provisioning *and* attachment, not each
-/// separately: a run whose attach is held past the deadline fails with exit 1.
+#[test]
+fn startup_timeout_during_create_still_saves_pending_and_deletes() {
+    let scratch = Scratch::new();
+    let (api, backend) = fixture(&scratch);
+    api.change(|behaviour| behaviour.create_delay = Duration::from_secs(3));
+    let state = body_dir(&scratch);
+    let mut process = spawn_forward(
+        &scratch,
+        &api,
+        &state,
+        &backend.target(),
+        &[
+            "--ephemeral",
+            "--startup-timeout",
+            "1",
+            "--shutdown-timeout",
+            "10",
+        ],
+    );
+
+    process
+        .expect_code(1, Duration::from_secs(15), "startup timeout during create")
+        .expect("startup must time out, then clean up the registration");
+    assert!(
+        process.stderr().contains("startup limit"),
+        "{}",
+        process.stderr()
+    );
+    assert!(!process.stdout_has("https://"));
+    assert_eq!(api.creates(), 1);
+    assert_eq!(api.deletes(), 1, "{}", process.stderr());
+    assert!(api.all_deleted());
+    assert!(!state.exists());
+}
+
+#[test]
+fn startup_timeout_reports_an_unconfirmed_create_if_grace_expires() {
+    let scratch = Scratch::new();
+    let (api, backend) = fixture(&scratch);
+    api.change(|behaviour| behaviour.create_delay = Duration::from_secs(30));
+    let state = body_dir(&scratch);
+    let mut process = spawn_forward(
+        &scratch,
+        &api,
+        &state,
+        &backend.target(),
+        &[
+            "--ephemeral",
+            "--startup-timeout",
+            "1",
+            "--shutdown-timeout",
+            "1",
+        ],
+    );
+
+    process
+        .expect_code(
+            1,
+            Duration::from_secs(10),
+            "create outlasts shutdown budget",
+        )
+        .expect("shutdown must not keep waiting for credentials");
+    assert!(
+        process.stderr().contains("a remote registration may exist"),
+        "{}",
+        process.stderr()
+    );
+    assert_eq!(api.creates(), 1);
+    assert_eq!(api.deletes(), 0);
+    assert!(state.exists());
+}
+
+/// Each phase fits individually, but their sum exceeds the startup deadline.
 #[test]
 fn startup_deadline_spans_provisioning_and_attachment() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
-    // Provisioning succeeds quickly; only attachment is slow.
-    api.change(|behaviour| behaviour.attach_delay = Duration::from_secs(30));
+    api.change(|behaviour| {
+        behaviour.create_delay = Duration::from_secs(3);
+        behaviour.attach_delay = Duration::from_secs(3);
+    });
     let state = body_dir(&scratch);
 
     let mut process = spawn_forward(
@@ -1448,16 +1521,18 @@ fn startup_deadline_spans_provisioning_and_attachment() {
         &api,
         &state,
         &backend.target(),
-        &["--startup-timeout", "3", "--shutdown-timeout", "10"],
+        &["--startup-timeout", "5", "--shutdown-timeout", "10"],
     );
 
     process
-        .expect_code(1, Duration::from_secs(45), "held attachment")
+        .expect_code(1, Duration::from_secs(20), "held attachment")
         .expect("a startup deadline must bound attachment too");
     assert!(
-        !process.stderr().is_empty(),
-        "the failure must explain which deadline expired"
+        process.stderr().contains("the bridge did not attach"),
+        "{}",
+        process.stderr()
     );
+    assert!(!process.stdout_has("https://"));
     // The identity was provisioned and is kept: a reusable run never deletes.
     assert!(
         profile(&state).join("tunnel.json").exists(),

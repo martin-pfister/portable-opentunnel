@@ -378,7 +378,7 @@ entirely** and `storage.remove` still `remove_dir_all`s the profile — silently
 abandoning a live remote registration. Confirmed: **do not call
 `Client::remove` on the pending path.**
 
-Use instead (the plan's sequence, now verified against the real signatures):
+Use the SDK only for the remote request (see `src/remote.rs`):
 
 ```rust
 let pending = client.pending(profile)?;            // client.rs:95, Option<PendingIdentity>
@@ -389,8 +389,12 @@ if let Some(p) = pending {
         Err(e) => return retain_state(e),                       // timeout => UNKNOWN
     }
 }
-client.storage().remove(profile)?;                 // storage.rs:165
 ```
+
+After the remote result is settled, record it in wrapper metadata before
+unlinking anything. Use the wrapper's name-by-name local cleanup
+(`src/cleanup.rs`), not `Storage::remove`, which would recurse into the
+profile and delete unrelated entries.
 
 Retry semantics of `Api::remove` (`api.rs:154-160`, `api.rs:74-104`,
 `api.rs:179-184`):

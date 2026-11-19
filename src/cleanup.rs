@@ -1,4 +1,4 @@
-//! Local deletion of a wrapper-owned state directory, and remote deletion.
+//! Local deletion of a wrapper-owned state directory.
 //!
 //! Deletion never recurses into an arbitrary user-supplied path. Only the
 //! documented layout is removed, file by file, after re-validating the lock:
@@ -8,10 +8,11 @@
 
 use std::fs;
 use std::io;
+use std::path::Path;
 
 use crate::error::{AppError, AppResult};
 use crate::layout;
-use crate::state::{self, StateLock};
+use crate::state::StateLock;
 
 /// Outcome of a local deletion.
 #[derive(Debug)]
@@ -25,10 +26,6 @@ pub struct LocalRemoval {
 }
 
 impl LocalRemoval {
-    pub fn is_clean(&self) -> bool {
-        self.failures.is_empty() && self.root_removed
-    }
-
     /// A short description for diagnostics.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
@@ -111,11 +108,11 @@ thread_local! {
 
 /// Arms [`inject_unlink_failure`] for the duration of the guard.
 #[cfg(test)]
-struct InjectedUnlinkFailure;
+pub(crate) struct InjectedUnlinkFailure;
 
 #[cfg(test)]
 impl InjectedUnlinkFailure {
-    fn arm(name: &str) -> Self {
+    pub(crate) fn arm(name: &str) -> Self {
         INJECTED_UNLINK.with(|slot| *slot.borrow_mut() = Some(name.to_owned()));
         Self
     }
@@ -144,10 +141,6 @@ fn remove_dir_if_present(
         Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
             retained.push(format!("{} (unrelated entries)", path.display()));
         }
-        // `ENOTEMPTY` is not always mapped; compare raw codes as well.
-        Err(error) if error.raw_os_error() == Some(libc::ENOTEMPTY) => {
-            retained.push(format!("{} (unrelated entries)", path.display()));
-        }
         Err(error) => failed.push(format!("{} ({error})", path.display())),
     }
 }
@@ -167,10 +160,20 @@ pub fn remove_local(lock: &mut StateLock) -> AppResult<LocalRemoval> {
     //    a directory kept alive by such entries is retained rather than failed.
     let profile = layout::profile_dir(&root);
     let sdk = layout::sdk_root(&root);
-    remove_owned_sdk_profile(&profile, &mut failures, &mut preserved);
-    remove_dir_if_present(&profile, &mut failures, &mut preserved);
-    remove_owned_sdk_dir(&sdk, &mut failures, &mut preserved);
-    remove_dir_if_present(&sdk, &mut failures, &mut preserved);
+    if let Some(sdk_entries) = read_owned_dir(&sdk)? {
+        if let Some(profile_entries) = read_owned_dir(&profile)? {
+            remove_owned_sdk_entries(
+                profile_entries,
+                &profile,
+                &mut failures,
+                &mut preserved,
+                true,
+            );
+            remove_dir_if_present(&profile, &mut failures, &mut preserved);
+        }
+        remove_owned_sdk_entries(sdk_entries, &sdk, &mut failures, &mut preserved, false);
+        remove_dir_if_present(&sdk, &mut failures, &mut preserved);
+    }
 
     // 2. Wrapper metadata and its temporary residue — but only once the owned
     //    SDK entries are actually gone. Removing the wrapper first would leave
@@ -178,15 +181,16 @@ pub fn remove_local(lock: &mut StateLock) -> AppResult<LocalRemoval> {
     //    can only call corrupt: a state the printed `delete` retry could never
     //    repair.
     let sdk_clean = failures.is_empty();
-    let entries = match fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return Err(AppError::io(format!("reading {}", root.display()))(error));
-        }
-    };
-    let mut own_names = Vec::new();
+    let entries =
+        fs::read_dir(&root).map_err(AppError::io(format!("reading {}", root.display())))?;
     for entry in entries {
-        let entry = entry.map_err(AppError::io(format!("reading {}", root.display())))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(format!("reading {} ({error})", root.display()));
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             preserved.push("<non-UTF-8 name>".to_owned());
@@ -198,15 +202,14 @@ pub fn remove_local(lock: &mut StateLock) -> AppResult<LocalRemoval> {
                     // Keep the wrapper: it is the only record that this
                     // directory is ours and which route it carries.
                     preserved.push(name.to_owned());
-                } else if state::safe_to_remove(&entry.path()) {
-                    remove_entry(&entry.path(), &mut failures);
                 } else {
-                    preserved.push(name.to_owned());
+                    remove_owned_file(&entry, &mut failures);
                 }
             }
-            layout::RootEntry::Lock => own_names.push(name.to_owned()),
-            layout::RootEntry::SdkDir => preserved.push(name.to_owned()),
-            layout::RootEntry::Unknown => preserved.push(name.to_owned()),
+            layout::RootEntry::Lock => {}
+            layout::RootEntry::SdkDir | layout::RootEntry::Unknown => {
+                preserved.push(name.to_owned());
+            }
         }
     }
 
@@ -223,27 +226,20 @@ pub fn remove_local(lock: &mut StateLock) -> AppResult<LocalRemoval> {
         match fs::remove_dir(&root) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-            Err(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => false,
+            Err(error) => {
+                return Err(AppError::io(format!(
+                    "removing the empty state directory {} after removing its state",
+                    root.display()
+                ))(error));
+            }
         }
     } else {
         false
     };
 
-    if !root_removed && failures.is_empty() {
-        // Re-list to report what kept the directory alive.
-        if let Ok(entries) = fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !preserved.contains(&name) {
-                    preserved.push(name);
-                }
-            }
-        }
-        preserved.sort();
-        preserved.dedup();
-    }
-    let _ = own_names;
-
+    preserved.sort_unstable();
+    preserved.dedup();
     Ok(LocalRemoval {
         failures,
         root_removed,
@@ -251,56 +247,67 @@ pub fn remove_local(lock: &mut StateLock) -> AppResult<LocalRemoval> {
     })
 }
 
-fn remove_owned_sdk_profile(
-    profile: &std::path::Path,
+/// Check each known directory component before enumerating it. In particular,
+/// `read_dir` itself would follow a symlink at `sdk` or `sdk/default`.
+fn read_owned_dir(path: &Path) -> AppResult<Option<fs::ReadDir>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::read_dir(path)
+            .map(Some)
+            .map_err(AppError::io(format!("reading {}", path.display()))),
+        Ok(_) => Err(AppError::fail(format!(
+            "{} is not a real directory; refusing local cleanup",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::io(format!("inspecting {}", path.display()))(
+            error,
+        )),
+    }
+}
+
+fn remove_owned_sdk_entries(
+    entries: fs::ReadDir,
+    dir: &Path,
     failures: &mut Vec<String>,
     preserved: &mut Vec<String>,
+    in_profile: bool,
 ) {
-    let Ok(entries) = fs::read_dir(profile) else {
-        return;
-    };
-    for entry in entries.flatten() {
+    let prefix = if in_profile { "sdk/default" } else { "sdk" };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(format!("reading {} ({error})", dir.display()));
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            preserved.push("sdk/default/<non-UTF-8 name>".to_owned());
+            preserved.push(format!("{prefix}/<non-UTF-8 name>"));
             continue;
         };
-        match layout::profile_entry(name) {
-            layout::ProfileEntry::Final | layout::ProfileEntry::Temp => {
-                if state::safe_to_remove(&entry.path()) {
-                    remove_entry(&entry.path(), failures);
-                } else {
-                    preserved.push(format!("sdk/default/{name}"));
-                }
-            }
-            layout::ProfileEntry::Unknown => preserved.push(format!("sdk/default/{name}")),
+        if !in_profile && name == layout::PROFILE {
+            continue;
+        }
+        let owned = if in_profile {
+            layout::profile_entry(name) != layout::ProfileEntry::Unknown
+        } else {
+            layout::is_profile_temp(name)
+        };
+        if owned {
+            remove_owned_file(&entry, failures);
+        } else {
+            preserved.push(format!("{prefix}/{name}"));
         }
     }
 }
 
-fn remove_owned_sdk_dir(
-    sdk: &std::path::Path,
-    failures: &mut Vec<String>,
-    preserved: &mut Vec<String>,
-) {
-    let Ok(entries) = fs::read_dir(sdk) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            preserved.push("sdk/<non-UTF-8 name>".to_owned());
-            continue;
-        };
-        if name == layout::PROFILE {
-            continue;
-        }
-        // Residue can also be left directly in the storage root.
-        if layout::is_profile_temp(name) && state::safe_to_remove(&entry.path()) {
-            remove_entry(&entry.path(), failures);
-        } else {
-            preserved.push(format!("sdk/{name}"));
-        }
+fn remove_owned_file(entry: &fs::DirEntry, failures: &mut Vec<String>) {
+    match entry.file_type() {
+        Ok(kind) if kind.is_file() => remove_entry(&entry.path(), failures),
+        Ok(_) => failures.push(format!("{} (not a regular file)", entry.path().display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => failures.push(format!("inspecting {} ({error})", entry.path().display())),
     }
 }
 
@@ -308,8 +315,7 @@ fn remove_owned_sdk_dir(
 mod tests {
     use super::*;
 
-    use crate::layout::PROFILE;
-    use crate::state::{DEFAULT_API, Mode, WrapperMeta, write_wrapper};
+    use crate::state::{self, DEFAULT_API, Mode, WrapperMeta, write_wrapper};
     use crate::test_support::TempDir;
 
     fn populated(root: &std::path::Path) {
@@ -514,8 +520,50 @@ mod tests {
     }
 
     #[test]
-    fn profile_constant_matches_layout() {
-        assert_eq!(PROFILE, layout::PROFILE);
+    fn refuses_a_symlinked_sdk_directory_or_profile() {
+        use std::os::unix::fs::symlink;
+
+        for symlink_at_profile in [false, true] {
+            let temp = TempDir::new();
+            let root = temp.path().join("state");
+            state::create_private_dir(&root).unwrap();
+            if symlink_at_profile {
+                state::create_private_dir(&layout::sdk_root(&root)).unwrap();
+            }
+            write_wrapper(
+                &root,
+                &WrapperMeta::new(Mode::Reusable, DEFAULT_API.to_owned(), "abc".to_owned()),
+            )
+            .unwrap();
+            let target = temp.path().join("not-state");
+            let profile = if symlink_at_profile {
+                target.clone()
+            } else {
+                target.join(layout::PROFILE)
+            };
+            fs::create_dir_all(&profile).unwrap();
+            let token = profile.join(layout::TOKEN);
+            fs::write(&token, b"keep me").unwrap();
+            let link = if symlink_at_profile {
+                layout::profile_dir(&root)
+            } else {
+                layout::sdk_root(&root)
+            };
+            symlink(&target, &link).unwrap();
+
+            assert!(matches!(
+                state::classify(&root).unwrap(),
+                state::Classification::Corrupt { .. }
+            ));
+            let mut lock = StateLock::acquire(&root, true).unwrap();
+            let error = remove_local(&mut lock).unwrap_err();
+            assert!(
+                error.message.contains(&link.display().to_string()),
+                "{error}"
+            );
+            assert_eq!(fs::read(&token).unwrap(), b"keep me");
+            assert!(root.join(layout::WRAPPER_FILE).exists());
+        }
     }
 
     #[test]

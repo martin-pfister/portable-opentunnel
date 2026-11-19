@@ -46,14 +46,13 @@ cargo test --locked
 
 step "dependency licenses, advisories, bans, sources"
 if cargo deny --version >/dev/null 2>&1; then
-  cargo deny --all-features check
+  cargo deny --all-features --locked check
 else
   cat >&2 <<'MSG'
 local-checks: cargo-deny is not installed, so the dependency license/security
 gate did not run. Install it with:
     cargo install cargo-deny --locked --version 0.21.0
-For manual review without cargo-deny, see README.md "Dependency license and
-security checks".
+For manual review without cargo-deny, see docs/ci.md#dependency-policy.
 MSG
   exit 1
 fi
@@ -69,7 +68,8 @@ if [[ $run_musl -eq 1 ]]; then
   # shellcheck source=/dev/null
   . "$here/musl-env.sh"
   cargo build --release --locked --target x86_64-unknown-linux-musl
-  "$here/check-static-elf.sh" "target/x86_64-unknown-linux-musl/release/portable-opentunnel"else
+  "$here/check-static-elf.sh" "target/x86_64-unknown-linux-musl/release/portable-opentunnel"
+else
   step "static release build skipped (--no-musl)"
 fi
 

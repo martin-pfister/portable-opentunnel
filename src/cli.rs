@@ -49,7 +49,7 @@ pub struct CommonArgs {
     #[arg(long, short = 'd', global = true, value_name = "DIR")]
     pub directory: Option<PathBuf>,
 
-    /// Create a disposable identity in a new private directory and delete it on exit
+    /// Create a disposable identity in a new directory and try to delete it on exit
     #[arg(long, global = true)]
     pub ephemeral: bool,
 
@@ -61,7 +61,7 @@ pub struct CommonArgs {
     #[arg(long, global = true, hide = true, value_name = "URL")]
     pub api: Option<String>,
 
-    /// Seconds to wait for provisioning and attachment
+    /// Total seconds to wait for provisioning and attachment
     #[arg(long, global = true, value_name = "SECONDS", default_value_t = 600)]
     pub startup_timeout: u64,
 

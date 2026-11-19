@@ -233,8 +233,12 @@ fn scan_sdk_dir(root: &Path, scan: &mut Scan) -> AppResult<SdkContent> {
             "inspecting {}",
             entry.path().display()
         )))?;
-        if name == layout::PROFILE && file_type.is_dir() {
-            content = SdkContent::Profile;
+        if name == layout::PROFILE {
+            if file_type.is_dir() {
+                content = SdkContent::Profile;
+            } else {
+                scan.unsafe_entries.push(format!("sdk/{name}"));
+            }
         } else if file_type.is_file() && layout::is_profile_temp(name) {
             scan.residue.push(entry.path());
         } else {
@@ -618,19 +622,6 @@ impl StateLock {
             dir_id,
         };
         lock.validate()?;
-        Ok(lock)
-    }
-
-    /// Acquires the lock for a deletion.
-    ///
-    /// The directory must be private and owned by this user before it is
-    /// locked, and ownership is re-checked afterwards: the decision that "this
-    /// is our state" must be made under the lock, never before it.
-    pub fn acquire_for_delete(root: &Path) -> AppResult<Self> {
-        check_private_dir(root)?;
-        let lock = Self::acquire(root, true)?;
-        lock.validate()?;
-        check_private_dir(root)?;
         Ok(lock)
     }
 

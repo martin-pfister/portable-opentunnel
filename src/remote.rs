@@ -19,7 +19,7 @@
 //! deleted explicitly through `client.api().remove` as well.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::Instant;
 
 use opentunnel::{Error as SdkError, Identity, PendingIdentity};
 
@@ -67,7 +67,7 @@ pub struct Request<'a> {
     pub api: &'a str,
     pub state_root: &'a Path,
     pub ca_cert: Option<&'a Path>,
-    pub deadline: Duration,
+    pub deadline: Instant,
 }
 
 /// Requests deletion of the saved registration, if any, and nothing else.
@@ -84,7 +84,7 @@ pub fn delete_saved_identity(request: Request<'_>) -> AppResult<Outcome> {
         ca_cert,
         deadline,
     } = request;
-    if deadline.is_zero() {
+    if deadline <= Instant::now() {
         return Ok(Outcome::Uncertain);
     }
 
@@ -102,7 +102,7 @@ async fn remote_only(
     api: &str,
     state_root: &Path,
     ca_cert: Option<&Path>,
-    deadline: Duration,
+    deadline: Instant,
 ) -> AppResult<Outcome> {
     let client = build_client(api, state_root, ca_cert)?;
 
@@ -126,7 +126,11 @@ async fn remote_only(
         return Ok(Outcome::Nothing);
     };
 
-    match tokio::time::timeout(deadline, client.api().remove(&token, &id)).await {
+    // Client setup and synchronous credential reads also use up the budget.
+    if deadline <= Instant::now() {
+        return Ok(Outcome::Uncertain);
+    }
+    match tokio::time::timeout_at(deadline.into(), client.api().remove(&token, &id)).await {
         Ok(Ok(())) => Ok(Outcome::Deleted),
         // A confirmed 404 means the registration is gone already.
         Ok(Err(error)) => Ok(match outcome_for_error(status_of(&error)) {
@@ -158,6 +162,7 @@ pub fn outcome_for_error(status: u16) -> Option<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn outcomes_gate_local_removal() {
@@ -174,7 +179,7 @@ mod tests {
             api: "http://127.0.0.1:1",
             state_root: temp.path(),
             ca_cert: None,
-            deadline: Duration::ZERO,
+            deadline: Instant::now(),
         })
         .unwrap();
         assert_eq!(outcome, Outcome::Uncertain);
@@ -189,7 +194,7 @@ mod tests {
             api: "http://127.0.0.1:1",
             state_root: &root,
             ca_cert: None,
-            deadline: Duration::from_millis(50),
+            deadline: Instant::now() + Duration::from_millis(50),
         })
         .unwrap();
         assert_eq!(outcome, Outcome::Nothing);
@@ -211,7 +216,7 @@ mod tests {
             api: "http://127.0.0.1:1",
             state_root: &root,
             ca_cert: None,
-            deadline: Duration::from_millis(20),
+            deadline: Instant::now() + Duration::from_millis(20),
         });
         assert!(profile.join(layout::TOKEN).exists());
         assert!(profile.join(layout::TUNNEL).exists());

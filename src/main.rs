@@ -53,12 +53,6 @@ fn write_stdout(url: &str) -> Result<(), AppError> {
 }
 
 fn execute(invocation: &Invocation) -> Result<Completed, AppError> {
-    let mode = if invocation.ephemeral {
-        Mode::Ephemeral
-    } else {
-        Mode::Reusable
-    };
-
     match &invocation.action {
         // `url` is local and offline: it must not fail because a CA setting
         // for *network* operations is unusable.
@@ -80,35 +74,29 @@ fn execute(invocation: &Invocation) -> Result<Completed, AppError> {
                 invocation.verbose,
             )
         }
-        Action::Init => {
+        action @ (Action::Init | Action::Forward(_)) => {
             let trust = trust::Trust::resolve(invocation.ca_cert.clone())?;
             let run = Run {
                 state_dir: invocation.directory.clone(),
-                mode,
+                mode: if invocation.ephemeral {
+                    Mode::Ephemeral
+                } else {
+                    Mode::Reusable
+                },
                 api_override: invocation.api.as_deref(),
                 ca_cert: trust.ca_cert.as_deref(),
                 startup_timeout: invocation.startup_timeout,
                 shutdown_timeout: invocation.shutdown_timeout,
                 verbose: invocation.verbose,
             };
+            if let Action::Forward(target) = action {
+                return forward::forward(&run, target);
+            }
             // `init` prints the URL only after the identity exists; it never
             // claims forwarding is ready.
             let completed = forward::init(&run)?;
             write_stdout(&completed.url)?;
             Ok(completed)
-        }
-        Action::Forward(target) => {
-            let trust = trust::Trust::resolve(invocation.ca_cert.clone())?;
-            let run = Run {
-                state_dir: invocation.directory.clone(),
-                mode,
-                api_override: invocation.api.as_deref(),
-                ca_cert: trust.ca_cert.as_deref(),
-                startup_timeout: invocation.startup_timeout,
-                shutdown_timeout: invocation.shutdown_timeout,
-                verbose: invocation.verbose,
-            };
-            forward::forward(&run, target)
         }
     }
 }

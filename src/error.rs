@@ -36,12 +36,6 @@ impl AppError {
         let context = context.into();
         move |source| Self::fail(format!("{context}: {source}"))
     }
-
-    /// True when the failure only means a reader closed the pipe; callers
-    /// treat that as a normal end rather than an operational error.
-    pub fn is_broken_pipe(&self) -> bool {
-        self.code == FAILURE && self.message.contains("Broken pipe")
-    }
 }
 
 impl fmt::Display for AppError {

@@ -4,13 +4,64 @@ This document describes what `.github/workflows/` is configured to run, which
 container digest is pinned and why, how to reproduce the container run locally,
 and what is deliberately **not** automated.
 
-> **Status: CI is green.** The full suite runs inside the pinned AlmaLinux 8.8
-> container, unprivileged, against the actual release executable, and every job
-> passes. Sizes, checksums, and test counts below are labelled with whether they
-> came from CI or from a local build; they are not interchangeable.
+See the [workflow runs](https://github.com/martin-pfister/portable-opentunnel/actions/workflows/ci.yml)
+for current status. The pinned AlmaLinux 8.8 container exercises the actual
+release executable as an unprivileged user.
 
 Nothing here contacts the hosted OpenTunnel service. No workflow requires
 credentials, and no workflow produces tunnel identities.
+
+## Build from source
+
+In a checkout, use the Rust version pinned in `rust-toolchain.toml` and install
+a musl C compiler (for example, `sudo apt-get install musl-tools` on
+Debian/Ubuntu). The SDK's `ring` dependency builds C and assembly.
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+. scripts/ci/musl-env.sh
+cargo build --release --locked --target x86_64-unknown-linux-musl
+scripts/ci/check-static-elf.sh target/x86_64-unknown-linux-musl/release/portable-opentunnel
+```
+
+The linkage check verifies that the binary has no dynamic loader or
+`DT_NEEDED` entries.
+
+## Local checks
+
+```sh
+scripts/ci/local-checks.sh           # format, lint, host tests, dependency gate, static build
+scripts/ci/local-checks.sh --no-musl # skip the static build
+```
+
+The tests use local fixtures, not the hosted API. Builds and dependency checks
+may need downloads. Neither command runs the
+[AlmaLinux acceptance tests](#reproducing-the-container-run-locally).
+
+## Dependency policy
+
+Install the same dependency checker CI uses and run it against the lockfile:
+
+```sh
+cargo install cargo-deny --locked --version 0.21.0
+cargo deny --all-features --locked check
+```
+
+[`deny.toml`](../deny.toml) enforces the license allowlist, RustSec advisories
+and yanks, dependency bans (including OpenSSL/native-tls), and crates.io-only
+sources. Dependencies must be suitable for redistribution in a static binary.
+To inspect licenses manually, use the command below; it is a review aid,
+not a replacement for the CI gate.
+
+```sh
+cargo metadata --locked --format-version 1 |
+  jq -r '.packages[] | "\(.name) \(.version) \(.license // "UNKNOWN")"' |
+  sort -u
+```
+
+Dependabot opens weekly Cargo and Actions update PRs without auto-merging.
+Before updating the pinned OpenTunnel SDK, repeat the
+[SDK audit](../SDK-AUDIT.md).
 
 ## Triggers
 
@@ -390,10 +441,10 @@ that can run without Rust or a container were checked locally:
 - `musl-env.sh` — sets and persists the linker variables when `musl-gcc` is
   present, and warns when it is not.
 
-### Dependency check: passed, from pristine sources
+### Dependency check on the recorded revision
 
-`cargo deny --all-features --locked check` passes against the current
-`Cargo.lock`:
+`cargo deny --all-features --locked check` passed against the lockfile used for
+the recorded run:
 
 ```
 advisories ok, bans ok, licenses ok, sources ok
@@ -407,13 +458,12 @@ throwaway directory. The only output was three `warning[duplicate]` notes
 `[bans] multiple-versions = "warn"` because those duplicates come from the
 pinned upstream SDK's tree.
 
-This is the one gate with a real local result. It says the dependency graph is
-acceptable; it says nothing about whether this crate builds or its tests pass.
-
 To reproduce:
 
 ```sh
+mkdir -p target/test-tmp
 root=$(mktemp -d "$PWD/target/test-tmp/deny.XXXXXX")
+mkdir -p "$root/tmp"
 CARGO_HOME=$root/cargo-home TMPDIR=$root/tmp CARGO_TARGET_DIR=$root/target \
   CARGO_BUILD_JOBS=1 \
   cargo install cargo-deny --locked --version 0.21.0 --root "$root/install"

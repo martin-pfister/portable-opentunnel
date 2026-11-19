@@ -17,12 +17,13 @@
 //! so once `block_on` returns every SDK task is suspended and cannot race
 //! local deletion. Remote deletion uses a separate fresh runtime.
 
+use std::cell::Cell;
+use std::future::poll_fn;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use opentunnel::{Client, Identity, Route, Routes, State, Status, Tunnel};
+use opentunnel::{Client, Identity, ProvisionStage, Route, Routes, State, Tunnel};
 
 use crate::bridge::{self, Provisioned};
 use crate::budget::Budget;
@@ -78,9 +79,7 @@ pub fn init(run: &Run<'_>) -> AppResult<Completed> {
             url: state.url(&identity),
             warnings: Vec::new(),
         }),
-        // An interrupted or failed init never attaches; in explicit ephemeral
-        // mode its registration still has to be cleaned up.
-        Err(error) => Err(state.fail_with_cleanup(run, &budget, error, true)),
+        Err(error) => Err(state.fail_with_cleanup(run, &budget, error)),
     }
 }
 
@@ -99,14 +98,14 @@ pub fn forward(run: &Run<'_>, target: &Target) -> AppResult<Completed> {
     match outcome {
         Ok(Forwarded::Signalled(sig, url)) => {
             run.log(format!("{} received; stopping", sig.name()));
-            let warnings = state.finish(run, &budget, true)?;
+            let warnings = state.finish(run, &budget)?;
             Ok(Completed { url, warnings })
         }
         Ok(Forwarded::Terminal(error)) => {
             let error = AppError::fail(format!("the tunnel stopped: {error}"));
-            Err(state.fail_with_cleanup(run, &budget, error, true))
+            Err(state.fail_with_cleanup(run, &budget, error))
         }
-        Err(error) => Err(state.fail_with_cleanup(run, &budget, error, true)),
+        Err(error) => Err(state.fail_with_cleanup(run, &budget, error)),
     }
 }
 
@@ -207,9 +206,7 @@ impl Prepared {
             }
             Classification::Corrupt { reason } => {
                 return Err(AppError::fail(format!(
-                    "{reason}. The credentials were preserved; run `portable-opentunnel delete \
-                     --directory {}` to discard them deliberately",
-                    root.display()
+                    "{reason}. The credentials were preserved for manual recovery"
                 )));
             }
             Classification::Unrelated { reason } => {
@@ -240,34 +237,18 @@ impl Prepared {
     }
 
     /// Stops the invocation and, in ephemeral mode, deletes the identity.
-    ///
-    /// `remote_possible` says whether a remote registration may exist; it is
-    /// false only when provisioning never could have created one. Returns
-    /// cleanup warnings, so every failure is reported even when an earlier
-    /// error decides the exit status.
-    fn finish(
-        &mut self,
-        run: &Run<'_>,
-        budget: &Budget,
-        remote_possible: bool,
-    ) -> AppResult<Vec<String>> {
-        let mut warnings = Vec::new();
+    fn finish(&mut self, run: &Run<'_>, budget: &Budget) -> AppResult<Vec<String>> {
         if run.mode == Mode::Reusable {
             run.log(format!(
                 "identity kept in {}; the URL stays the same next time",
                 self.root.display()
             ));
-            return Ok(warnings);
-        }
-        if !remote_possible {
-            return Ok(warnings);
+            return Ok(Vec::new());
         }
         // The budget was armed when shutdown began, so this shares whatever is
         // left with the earlier grace and tunnel close.
-        let remaining = budget.remaining();
-        if remaining.is_zero() {
+        if budget.expired() {
             return Ok(warnings_with_recovery(
-                warnings,
                 &format!(
                     "the {} second shutdown budget was exhausted before the registration was deleted",
                     budget.timeout().as_secs()
@@ -276,34 +257,44 @@ impl Prepared {
             ));
         }
 
+        self.lock.validate()?;
         let outcome = remote::delete_saved_identity(remote::Request {
             api: &self.meta.api,
             state_root: &self.root,
             ca_cert: run.ca_cert,
-            deadline: remaining,
+            deadline: budget.arm(),
         });
         match outcome {
             Ok(outcome) if outcome.may_remove_local() => {
                 run.log(outcome.describe());
             }
             Ok(outcome) => {
-                return Ok(warnings_with_recovery(
-                    warnings,
-                    outcome.describe(),
-                    &self.root,
-                ));
+                return Ok(warnings_with_recovery(outcome.describe(), &self.root));
             }
             Err(error) => {
-                return Ok(warnings_with_recovery(warnings, &error.message, &self.root));
+                return Ok(warnings_with_recovery(&error.message, &self.root));
             }
         }
 
-        // The remote call may have consumed the rest of the budget. Removing
-        // files is cheap, but the caller's deadline is the contract, so stop
-        // here and leave a resumable directory rather than overrun it.
+        self.finish_local(budget)
+    }
+
+    /// Records a settled remote result even if no time remains to unlink files.
+    fn finish_local(&mut self, budget: &Budget) -> AppResult<Vec<String>> {
+        self.lock.validate()?;
+        if let Err(error) = state::mark_remote_deleted(&self.root, &self.meta) {
+            return Ok(warnings_with_recovery(
+                &format!(
+                    "{}; the remote registration is gone but the deletion could not be \
+                     recorded, so no local file was removed",
+                    error.message
+                ),
+                &self.root,
+            ));
+        }
+
         if budget.expired() {
             return Ok(warnings_with_recovery(
-                warnings,
                 &format!(
                     "the {} second shutdown budget ran out before local cleanup; the remote \
                      registration is gone and the directory is marked for resumption",
@@ -313,47 +304,27 @@ impl Prepared {
             ));
         }
 
-        // Durably record that the remote registration is gone *before* any
-        // credential is unlinked, so an interruption here stays resumable.
-        self.meta = match state::mark_remote_deleted(&self.root, &self.meta) {
-            Ok(marked) => marked,
-            Err(error) => {
-                return Ok(warnings_with_recovery(
-                    warnings,
-                    &format!(
-                        "{}; the remote registration is gone but the deletion could not be \
-                         recorded, so no local file was removed",
-                        error.message
-                    ),
-                    &self.root,
-                ));
-            }
-        };
-
         let removal = cleanup::remove_local(&mut self.lock)?;
-        if !removal.is_clean() {
-            warnings.push(removal.describe());
+        if !removal.failures.is_empty() {
+            return Ok(vec![format!(
+                "{}; retry with: {}",
+                removal.describe(),
+                cleanup::recovery_command(&self.root)
+            )]);
         }
-        Ok(warnings)
+        Ok(if removal.root_removed {
+            Vec::new()
+        } else {
+            vec![removal.describe()]
+        })
     }
 
     /// Combines an earlier failure with cleanup diagnostics.
-    fn fail_with_cleanup(
-        &mut self,
-        run: &Run<'_>,
-        budget: &Budget,
-        error: AppError,
-        remote_possible: bool,
-    ) -> AppError {
+    fn fail_with_cleanup(&mut self, run: &Run<'_>, budget: &Budget, error: AppError) -> AppError {
         let mut messages = vec![error.message];
-        match self.finish(run, budget, remote_possible) {
+        match self.finish(run, budget) {
             Ok(warnings) => messages.extend(warnings),
-            Err(cleanup_error) => messages.push(format!(
-                "cleanup also failed: {}. Credentials were kept at {}; retry with: {}",
-                cleanup_error.message,
-                self.root.display(),
-                cleanup::recovery_command(&self.root)
-            )),
+            Err(cleanup_error) => messages.push(format!("cleanup also failed: {cleanup_error}")),
         }
         AppError {
             code: error.code,
@@ -362,14 +333,13 @@ impl Prepared {
     }
 }
 
-/// Adds the exact recovery command to a cleanup problem.
-fn warnings_with_recovery(mut warnings: Vec<String>, problem: &str, root: &Path) -> Vec<String> {
-    warnings.push(format!(
+/// Adds the recovery command to a cleanup problem.
+fn warnings_with_recovery(problem: &str, root: &Path) -> Vec<String> {
+    vec![format!(
         "{problem}. Credentials were kept at {}; retry with: {}",
         root.display(),
         cleanup::recovery_command(root)
-    ));
-    warnings
+    )]
 }
 
 /// Applies the mode and endpoint rules to metadata that already exists.
@@ -389,21 +359,6 @@ fn adopt_meta(mut meta: WrapperMeta, run: &Run<'_>) -> AppResult<WrapperMeta> {
 // Provisioning
 // ---------------------------------------------------------------------------
 
-const STAGE_REQUESTING: u8 = 4;
-
-fn stage_code(stage: opentunnel::ProvisionStage) -> u8 {
-    match stage {
-        opentunnel::ProvisionStage::CreatingTunnel => 0,
-        opentunnel::ProvisionStage::GeneratingKey => 1,
-        opentunnel::ProvisionStage::GeneratingCsr => 2,
-        opentunnel::ProvisionStage::ResumingCertificate => 3,
-        opentunnel::ProvisionStage::RequestingCertificate => STAGE_REQUESTING,
-        opentunnel::ProvisionStage::WaitingCertificate => 5,
-        opentunnel::ProvisionStage::SavingIdentity => 6,
-        opentunnel::ProvisionStage::Ready => 7,
-    }
-}
-
 /// Ensures a complete identity exists, bounded by the startup deadline and
 /// interruptible by signals.
 async fn provision_and_finish(
@@ -414,19 +369,7 @@ async fn provision_and_finish(
     let client = state.sdk_client(run.ca_cert)?;
     let mut listener = Signals::new()
         .map_err(|error| AppError::fail(format!("installing signal handlers: {error}")))?;
-    let stage = Arc::new(AtomicU8::new(255));
-    let startup_deadline = startup_deadline(run);
-    let result = provision_bounded(
-        &client,
-        run,
-        &stage,
-        &mut listener,
-        budget,
-        startup_deadline,
-    )
-    .await;
-    drop(client);
-    result
+    provision_bounded(&client, run, &mut listener, budget, startup_deadline(run)).await
 }
 
 /// The one deadline that bounds provisioning *and* attachment.
@@ -456,17 +399,11 @@ enum ProvisioningEvent {
 /// Provisions the identity, bounded by the startup deadline and interruptible
 /// by a signal.
 ///
-/// The provisioning future is created **outside** the `select!` and pinned, so
-/// winning the signal branch never drops it. Dropping it would cancel the SDK
-/// mid-`create`, which is exactly the case that can leave a remote
-/// registration whose token was never saved. After a signal the same future is
-/// polled until the pending identity is on disk (the `RequestingCertificate`
-/// stage), so an ephemeral run can always delete it — all within the one
-/// shutdown budget, and without spawning any unjoined work.
+/// On timeout or signal, keep polling an in-flight create within the
+/// shutdown budget so the SDK has a chance to save its pending credentials.
 async fn provision_bounded(
     client: &Client,
     run: &Run<'_>,
-    stage: &Arc<AtomicU8>,
     listener: &mut Signals,
     budget: &Budget,
     startup_deadline: Instant,
@@ -478,9 +415,14 @@ async fn provision_bounded(
         Provisioned::Absent => "no saved identity; creating one",
     });
 
-    let stage_progress = Arc::clone(stage);
-    let progress = move |stage: opentunnel::ProvisionStage| {
-        stage_progress.store(stage_code(stage), Ordering::SeqCst);
+    let create_without_credentials = Cell::new(false);
+    let progress = |stage| {
+        match stage {
+            ProvisionStage::CreatingTunnel => create_without_credentials.set(true),
+            // The SDK calls this only after persisting the pending identity.
+            ProvisionStage::RequestingCertificate => create_without_credentials.set(false),
+            _ => {}
+        }
         run.log(bridge::describe(stage));
     };
 
@@ -509,56 +451,36 @@ async fn provision_bounded(
         sig = listener.wait() => ProvisioningEvent::Signalled(sig),
     };
 
-    match first {
-        ProvisioningEvent::Settled(result) => result,
-        ProvisioningEvent::TimedOut => Err(AppError::fail(format!(
+    let mut error = match first {
+        ProvisioningEvent::Settled(result) => return result,
+        ProvisioningEvent::TimedOut => AppError::fail(format!(
             "provisioning did not finish within the {} second startup limit",
             run.startup_timeout.as_secs()
-        ))),
-        ProvisioningEvent::Signalled(sig) => {
-            // Shutdown starts now: this arms the shared budget once.
-            budget.arm();
-            poll_until_pending_is_saved(&mut provisioning, stage, budget).await;
-            Err(AppError::new(
-                sig.exit_code(),
-                format!(
-                    "interrupted by {} during provisioning; the shutdown budget of {} seconds \
-                     bounds the remaining cleanup",
-                    sig.name(),
-                    budget.timeout().as_secs()
-                ),
-            ))
+        )),
+        ProvisioningEvent::Signalled(sig) => AppError::new(
+            sig.exit_code(),
+            format!("interrupted by {} during provisioning", sig.name()),
+        ),
+    };
+    let deadline = budget.arm();
+    if create_without_credentials.get() {
+        // Check progress after each poll of the same future, rather than
+        // waiting for certificate issuance or polling on a periodic timer.
+        let grace = poll_fn(|cx| {
+            if provisioning.as_mut().poll(cx).is_ready() || !create_without_credentials.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        let _ = tokio::time::timeout_at(deadline.into(), grace).await;
+        if create_without_credentials.get() {
+            error.message.push_str(
+                "; a remote registration may exist, but no credentials were saved to delete it",
+            );
         }
     }
-}
-
-/// Keeps polling an interrupted provisioning future until the SDK has saved
-/// the pending identity, it settles on its own, or the shutdown budget runs out.
-///
-/// The future is polled in place: no task is spawned, and nothing outlives this
-/// call. Progress is observed through the same stage counter the SDK reports.
-async fn poll_until_pending_is_saved<F>(
-    provisioning: &mut std::pin::Pin<&mut F>,
-    stage: &Arc<AtomicU8>,
-    budget: &Budget,
-) where
-    F: std::future::Future<Output = AppResult<Identity>>,
-{
-    const SLICE: Duration = Duration::from_millis(20);
-    loop {
-        if stage.load(Ordering::SeqCst) >= STAGE_REQUESTING {
-            return;
-        }
-        let remaining = budget.remaining();
-        if remaining.is_zero() {
-            return;
-        }
-        tokio::select! {
-            // Settling is fine too: the identity is then complete on disk.
-            _ = provisioning.as_mut() => return,
-            _ = tokio::time::sleep(remaining.min(SLICE)) => {}
-        }
-    }
+    Err(error)
 }
 
 // ---------------------------------------------------------------------------
@@ -579,18 +501,9 @@ async fn provision_attach_forward(
     let client = state.sdk_client(run.ca_cert)?;
     let mut listener = Signals::new()
         .map_err(|error| AppError::fail(format!("installing signal handlers: {error}")))?;
-    let stage = Arc::new(AtomicU8::new(255));
     // One deadline for provisioning *and* attachment.
     let startup_deadline = startup_deadline(run);
-    let identity = provision_bounded(
-        &client,
-        run,
-        &stage,
-        &mut listener,
-        budget,
-        startup_deadline,
-    )
-    .await?;
+    let identity = provision_bounded(&client, run, &mut listener, budget, startup_deadline).await?;
     // From here on, SDK-supplied text may be echoed to stderr, so the known
     // credentials are registered for redaction.
     let secrets = crate::redact::Secrets::from_identity(&identity);
@@ -728,15 +641,6 @@ fn write_url(url: &str) -> AppResult<()> {
         .map_err(AppError::io("writing the URL to stdout"))
 }
 
-/// Status for a diagnostic line, without credentials.
-#[allow(dead_code)]
-fn summarize(status: &Status) -> String {
-    format!(
-        "{:?} with {} connection(s)",
-        status.state, status.connections
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,6 +722,37 @@ mod tests {
             error.message.contains("delete --directory"),
             "the message must name the recovery command: {}",
             error.message
+        );
+    }
+
+    #[test]
+    fn confirmed_deletion_is_recorded_even_after_the_shutdown_budget_expires() {
+        let temp = TempDir::new();
+        let root = temp.path().join("state");
+        let run = run_for(&root, Mode::Ephemeral, "http://127.0.0.1:1");
+        let mut prepared = Prepared::open(&run).unwrap();
+        let profile = layout::profile_dir(&root);
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join(layout::TUNNEL),
+            br#"{"hostname":"abc.opentunnel.xyz"}"#,
+        )
+        .unwrap();
+        assert!(crate::url::run(Some(&root)).is_ok());
+
+        let warnings = prepared.finish_local(&Budget::new(Duration::ZERO)).unwrap();
+        assert!(warnings[0].contains("marked for resumption"));
+        assert!(profile.join(layout::TUNNEL).exists());
+        assert_eq!(
+            crate::url::run(Some(&root)).unwrap_err().code,
+            crate::error::NO_TUNNEL
+        );
+
+        drop(prepared);
+        crate::remove::run(Some(&root), None, None, Duration::ZERO, 0).unwrap();
+        assert!(
+            !root.exists(),
+            "a marked deletion can finish without network"
         );
     }
 

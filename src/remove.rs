@@ -5,15 +5,18 @@
 //! directories. Remote deletion happens first; local files are removed only
 //! after the remote outcome is confirmed or confirmed absent.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::budget::Budget;
 use crate::cleanup;
 use crate::directory;
 use crate::error::{AppError, AppResult};
 use crate::forward::Completed;
+use crate::layout;
 use crate::remote::{self, Outcome};
-use crate::state::{self, Classification, StateLock};
+use crate::state::{self, Classification, StateLock, WrapperMeta};
 
 pub fn run(
     directory: Option<&Path>,
@@ -27,52 +30,57 @@ pub fn run(
         None => directory::default_directory()?,
     };
     let mut warnings = Vec::new();
-    if !root.exists() {
-        warnings.push(format!(
-            "{} does not exist; nothing to delete",
-            root.display()
-        ));
-        return Ok(Completed {
-            url: String::new(),
-            warnings,
-        });
-    }
-
-    // Missing state is a read-only early return above; everything else is
-    // inspected *while holding the lock*, so a concurrent run cannot change
-    // the directory between the decision and the deletion.
-    let mut lock = StateLock::acquire_for_delete(&root)?;
-    let classification = state::classify(&root)?;
-    let (meta, mode_note) = match classification {
-        Classification::Initialized { meta, .. } => (meta, None),
-        Classification::Resumable { meta } => (
-            meta,
-            Some("the saved identity had not finished provisioning"),
-        ),
-        Classification::Deleting { meta } => (
-            meta,
-            Some("finishing a deletion whose remote registration is already gone"),
-        ),
-        Classification::FirstRun { .. } => {
-            // Only residue and/or the lock: nothing to delete remotely, but
-            // the leftovers can still be removed.
-            let removal = cleanup::remove_local(&mut lock)?;
-            warnings.push(removal.describe());
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!(
+                "{} does not exist; nothing to delete",
+                root.display()
+            ));
             return Ok(Completed {
                 url: String::new(),
                 warnings,
             });
         }
-        Classification::Corrupt { reason } => {
+        Err(error) => {
+            return Err(AppError::io(format!("inspecting {}", root.display()))(
+                error,
+            ));
+        }
+    }
+
+    state::check_private_dir(&root)?;
+    let lock_path = root.join(layout::LOCK_FILE);
+    let create_lock = match std::fs::symlink_metadata(&lock_path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Never write a lock to an unrecognized directory. Recheck the
+            // classification after locking before deleting anything.
+            delete_plan(&root)?;
+            true
+        }
+        Err(error) => {
+            return Err(AppError::io(format!("inspecting {}", lock_path.display()))(
+                error,
+            ));
+        }
+    };
+    let mut lock = StateLock::acquire(&root, create_lock)?;
+    state::check_private_dir(&root)?;
+    let Some((meta, mode_note)) = delete_plan(&root)? else {
+        // Recognized residue, but no identity to delete remotely.
+        let removal = cleanup::remove_local(&mut lock)?;
+        if !removal.failures.is_empty() {
             return Err(AppError::fail(format!(
-                "refusing to delete: {reason}. The credentials were preserved for manual recovery"
+                "local cleanup failed: {}",
+                removal.describe()
             )));
         }
-        Classification::Unrelated { reason } => {
-            return Err(AppError::fail(format!(
-                "refusing to delete: {reason}. This program only deletes directories it created"
-            )));
-        }
+        warnings.push(removal.describe());
+        return Ok(Completed {
+            url: String::new(),
+            warnings,
+        });
     };
     if let Some(note) = mode_note {
         warnings.push(note.to_owned());
@@ -106,7 +114,7 @@ pub fn run(
             api: &api,
             state_root: &root,
             ca_cert,
-            deadline,
+            deadline: Budget::new(deadline).arm(),
         }) {
             Ok(outcome) => outcome,
             Err(error) => return Err(kept_credentials(&root, &error.message)),
@@ -134,18 +142,19 @@ pub fn run(
     }
 
     let removal = cleanup::remove_local(&mut lock).map_err(|error| {
-        kept_credentials(
-            &root,
-            &format!("local cleanup could not start ({})", error.message),
-        )
+        AppError::fail(format!(
+            "the tunnel registration is gone but local cleanup failed: {error}"
+        ))
     })?;
-    warnings.extend(removal_diagnostics(&root, &removal));
     if !removal.failures.is_empty() {
         return Err(AppError::fail(format!(
             "the tunnel registration was deleted but local cleanup failed: {}. Retry with: {}",
             removal.failures.join("; "),
             cleanup::recovery_command(&root)
         )));
+    }
+    if !removal.root_removed {
+        warnings.push(removal.describe());
     }
     Ok(Completed {
         url: String::new(),
@@ -154,7 +163,7 @@ pub fn run(
 }
 
 /// An operational error that states plainly that nothing local was removed and
-/// names the exact retry command.
+/// names the retry command.
 fn kept_credentials(root: &Path, problem: &str) -> AppError {
     let problem = problem.trim_end_matches('.');
     AppError::fail(format!(
@@ -164,33 +173,36 @@ fn kept_credentials(root: &Path, problem: &str) -> AppError {
     ))
 }
 
-fn removal_diagnostics(root: &Path, removal: &cleanup::LocalRemoval) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if removal.root_removed {
-        return warnings;
-    }
-    if removal.preserved.is_empty() {
-        warnings.push(format!("{} was retained", root.display()));
-    } else {
-        warnings.push(format!(
-            "{} was retained because it contains entries this program does not own: {}",
+/// `None` means only recognized residue exists; no registration needs deleting.
+fn delete_plan(root: &Path) -> AppResult<Option<(WrapperMeta, Option<&'static str>)>> {
+    match state::classify(root)? {
+        Classification::Initialized { meta, .. } => Ok(Some((meta, None))),
+        Classification::Resumable { meta } => Ok(Some((
+            meta,
+            Some("the saved identity had not finished provisioning"),
+        ))),
+        Classification::Deleting { meta } => Ok(Some((
+            meta,
+            Some("finishing a deletion whose remote registration is already gone"),
+        ))),
+        Classification::Corrupt { reason } => Err(AppError::fail(format!(
+            "refusing to delete: {reason}. The credentials were preserved for manual recovery"
+        ))),
+        Classification::Unrelated { reason } => Err(AppError::fail(format!(
+            "refusing to delete: {reason}. This program only deletes recognized state"
+        ))),
+        Classification::FirstRun { residue } if residue.is_empty() => Err(AppError::fail(format!(
+            "refusing to delete: {} contains no recognized state for this program to remove",
             root.display(),
-            removal.preserved.join(", ")
-        ));
+        ))),
+        Classification::FirstRun { .. } => Ok(None),
     }
-    warnings
-}
-
-/// Whether a deletion outcome means the identity is gone for good.
-pub fn is_settled(outcome: Outcome) -> bool {
-    outcome.may_remove_local()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::layout;
     use crate::state::{DEFAULT_API, Mode, WrapperMeta, write_wrapper};
     use crate::test_support::TempDir;
     use std::fs;
@@ -244,6 +256,39 @@ mod tests {
         let error = run(Some(&root), None, None, Duration::from_millis(10), 0).unwrap_err();
         assert!(error.message.contains("only deletes"), "{}", error.message);
         assert!(root.join("notes.txt").exists());
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "no lock was created"
+        );
+    }
+
+    #[test]
+    fn refuses_a_private_directory_with_no_state() {
+        let temp = TempDir::new();
+        let root = temp.path().join("mine");
+        state::create_private_dir(&root).unwrap();
+
+        let error = run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap_err();
+
+        assert!(error.message.contains("no recognized state"), "{error}");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_inspection_error_is_not_a_missing_directory() {
+        let temp = TempDir::new();
+        let file = temp.path().join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        let root = file.join("state");
+
+        let error = run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap_err();
+
+        assert_eq!(error.code, crate::error::FAILURE);
+        assert!(
+            error.message.contains(&root.display().to_string()),
+            "{error}"
+        );
     }
 
     #[test]
@@ -310,9 +355,45 @@ mod tests {
         let temp = TempDir::new();
         let root = temp.path().join("state");
         state::create_private_dir(&root).unwrap();
-        fs::write(root.join("wrapper.json.tmp-1-abc"), b"{}").unwrap();
+        let residue = "wrapper.json.tmp-1-abc";
+        fs::write(root.join(residue), b"{}").unwrap();
+        {
+            let _failure = cleanup::InjectedUnlinkFailure::arm(residue);
+            let error = run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap_err();
+            assert!(error.message.contains(residue), "{error}");
+            assert!(root.join(residue).exists());
+        }
         run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn failure_to_remove_the_empty_root_is_reported() {
+        if state::current_uid() == 0 {
+            eprintln!("skipping rmdir permission check as root");
+            return;
+        }
+        let temp = TempDir::new();
+        let root = temp.path().join("state");
+        state::create_private_dir(&root).unwrap();
+        let meta = WrapperMeta::new(Mode::Reusable, DEFAULT_API.to_owned(), "route".to_owned());
+        state::mark_remote_deleted(&root, &meta).unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = run(Some(&root), None, None, Duration::ZERO, 0);
+
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.code, crate::error::FAILURE);
+        assert!(
+            error.message.contains("removing the empty state directory"),
+            "{error}"
+        );
+        assert!(
+            error.message.contains(&root.display().to_string()),
+            "{error}"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     }
 
     #[test]
