@@ -24,9 +24,9 @@ trap. Check how your site signals and cleans up jobs.
 
 - Set `--shutdown-timeout` below your site's grace period between SIGTERM and
   SIGKILL if you need ephemeral deletion to finish.
-- Choose a fresh ephemeral `--directory` on durable storage if you want to
-  retry deletion after node failure. The default temporary directory is often
-  node-local, and losing it can mean losing the only copy of the token.
+- `--ephemeral` always creates its own directory. Set `TMPDIR` to an existing
+  parent on durable storage if you want to keep recovery credentials after
+  node failure; the default temporary directory is often node-local.
 - For a stable URL, omit `--ephemeral` and supply the required `--directory`.
   Do not share that directory between concurrent jobs.
 

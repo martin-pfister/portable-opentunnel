@@ -60,6 +60,9 @@ expect_exit 2 "invalid target" "$binary" not-a-port
 expect_exit 2 "port 0" "$binary" 0
 expect_exit 2 "init with --ephemeral" "$binary" init --ephemeral
 expect_exit 2 "url with a target" "$binary" url 3000
+expect_exit 2 "ephemeral forwarding with --directory" "$binary" 3000 \
+  --ephemeral --directory "$home/disposable" \
+  --api http://127.0.0.1:1 --startup-timeout 1 --shutdown-timeout 1
 for action in 3000 init url delete; do
   expect_exit 2 "$action without --directory" "$binary" "$action" \
     --api http://127.0.0.1:1 --startup-timeout 1 --shutdown-timeout 1

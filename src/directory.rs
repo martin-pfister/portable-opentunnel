@@ -2,9 +2,8 @@
 //!
 //! * Reusable: `--directory` names the exact directory and is required.
 //!   It is created when missing, privately and exclusively.
-//! * Ephemeral: an explicit `--directory` must not exist at all (not even
-//!   empty) and is created exclusively; otherwise a unique directory under
-//!   `$TMPDIR` (falling back to the system temporary directory) is used.
+//! * Ephemeral: always create a unique private directory under `$TMPDIR`
+//!   (falling back to the system temporary directory).
 
 use std::ffi::OsString;
 use std::fs;
@@ -16,6 +15,22 @@ use crate::error::{AppError, AppResult};
 use crate::state::{self, Mode};
 
 const EPHEMERAL_PREFIX: &str = "portable-opentunnel-";
+
+/// How to choose the state directory for forwarding or init.
+#[derive(Clone, Copy)]
+pub enum Selection<'a> {
+    Reusable(&'a Path),
+    Ephemeral,
+}
+
+impl Selection<'_> {
+    pub fn mode(self) -> Mode {
+        match self {
+            Self::Reusable(_) => Mode::Reusable,
+            Self::Ephemeral => Mode::Ephemeral,
+        }
+    }
+}
 
 pub fn require_explicit(directory: Option<&Path>) -> AppResult<&Path> {
     directory.ok_or_else(|| {
@@ -60,43 +75,23 @@ pub fn choose_temporary_parent(tmpdir: Option<OsString>) -> PathBuf {
 }
 
 /// Picks and creates the directory for a forwarding or init invocation.
-pub fn prepare(directory: Option<&Path>, mode: Mode) -> AppResult<PathBuf> {
-    prepare_with(directory, mode, std::env::var_os("TMPDIR"))
+pub fn prepare(selection: Selection<'_>) -> AppResult<PathBuf> {
+    prepare_with(selection, std::env::var_os("TMPDIR"))
 }
 
 /// [`prepare`] with the ephemeral parent supplied explicitly, so the decision
 /// is testable without touching process-wide environment state.
-pub fn prepare_with(
-    directory: Option<&Path>,
-    mode: Mode,
-    tmpdir: Option<OsString>,
-) -> AppResult<PathBuf> {
-    match (mode, directory) {
-        (Mode::Reusable, directory) => {
-            let path = absolutize(require_explicit(directory)?);
+fn prepare_with(selection: Selection<'_>, tmpdir: Option<OsString>) -> AppResult<PathBuf> {
+    match selection {
+        Selection::Reusable(path) => {
+            let path = absolutize(path);
             create_reusable(&path)?;
             Ok(path)
         }
-        (Mode::Ephemeral, Some(path)) => {
-            let path = absolutize(path);
-            // An explicit ephemeral directory must not exist at all, so a
-            // persistent identity can never be turned into a disposable one.
-            create_new_private(&path).map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    AppError::fail(format!(
-                        "--ephemeral --directory {} exists; ephemeral state needs a new \
-                         directory. Choose another path, or run delete --directory {} to \
-                         remove a leftover run",
-                        path.display(),
-                        path.display()
-                    ))
-                } else {
-                    AppError::io(format!("creating {}", path.display()))(error)
-                }
-            })?;
-            Ok(path)
+        Selection::Ephemeral => {
+            let parent = absolutize(&choose_temporary_parent(tmpdir));
+            create_unique(&parent)
         }
-        (Mode::Ephemeral, None) => create_unique(&choose_temporary_parent(tmpdir)),
     }
 }
 
@@ -111,20 +106,11 @@ fn create_reusable(path: &Path) -> AppResult<()> {
             }
             state::check_private_dir(path)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            create_new_private(path).map_err(AppError::io(format!("creating {}", path.display())))
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => state::create_private_dir(path),
         Err(error) => Err(AppError::io(format!("inspecting {}", path.display()))(
             error,
         )),
     }
-}
-
-fn create_new_private(path: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(path)?;
-    state::fsync_dir(path).map_err(|error| io::Error::other(error.message))
 }
 
 /// Creates a unique private directory under `parent`, retrying on collision.
@@ -172,29 +158,19 @@ mod tests {
     fn explicit_reusable_directory_is_created_once() {
         let temp = TempDir::new();
         let path = temp.path().join("state");
-        let chosen = prepare(Some(&path), Mode::Reusable).unwrap();
+        let chosen = prepare(Selection::Reusable(&path)).unwrap();
         assert_eq!(chosen, path);
         assert!(private(&path));
         // A second run accepts the existing private directory.
-        let again = prepare(Some(&path), Mode::Reusable).unwrap();
+        let again = prepare(Selection::Reusable(&path)).unwrap();
         assert_eq!(again, path);
     }
 
     #[test]
     fn reusable_mode_requires_an_explicit_directory() {
-        let error = prepare(None, Mode::Reusable).unwrap_err();
+        let error = require_explicit(None).unwrap_err();
         assert_eq!(error.code, 2);
         assert!(error.message.contains("--directory"));
-    }
-
-    #[test]
-    fn explicit_ephemeral_directory_must_not_exist() {
-        let temp = TempDir::new();
-        let path = temp.path().join("run");
-        prepare(Some(&path), Mode::Ephemeral).unwrap();
-        // Even an empty existing directory is refused.
-        let error = prepare(Some(&path), Mode::Ephemeral).unwrap_err();
-        assert!(error.message.contains("exists"), "{}", error.message);
     }
 
     #[test]
@@ -261,16 +237,14 @@ mod tests {
         fs::create_dir(&real).unwrap();
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(prepare(Some(&link), Mode::Reusable).is_err());
-        assert!(prepare(Some(&link), Mode::Ephemeral).is_err());
+        assert!(prepare(Selection::Reusable(&link)).is_err());
     }
 
     #[test]
-    fn ephemeral_without_directory_uses_the_given_tmpdir() {
+    fn ephemeral_uses_the_given_tmpdir() {
         let temp = TempDir::new();
         let chosen = prepare_with(
-            None,
-            Mode::Ephemeral,
+            Selection::Ephemeral,
             Some(temp.path().as_os_str().to_owned()),
         )
         .unwrap();

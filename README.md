@@ -45,7 +45,7 @@ internet, and configure application authentication if needed.
 | Mode | State directory | On exit |
 | --- | --- | --- |
 | Reusable | Requires a private `--directory DIR` you choose | Keeps the identity and URL, even if the local target changes next time |
-| `--ephemeral` | Fresh private directory under `$TMPDIR`, or a `--directory DIR` that **does not exist yet** | Tries to delete the registration and local state |
+| `--ephemeral` | Fresh private directory under `$TMPDIR` (or `/tmp`); cannot be combined with `--directory` | Tries to delete the registration and local state |
 
 Give concurrent jobs separate directories. Only one process can modify a given
 state directory at a time, and shared storage must provide reliable cross-node
@@ -70,7 +70,7 @@ is shared by provisioning and attachment.
   the directory and retry. Supply your private CA again if you used one.
 - **Plan for node failure:** Ctrl+C and SIGTERM allow cleanup; SIGKILL and node
   failure do not. If node-local storage is lost, you cannot retry deletion
-  without the saved credentials. Use durable storage when that matters.
+  without the saved credentials. Point `TMPDIR` at durable storage if needed.
 
 ## More information
 

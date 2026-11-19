@@ -46,12 +46,12 @@ pub struct Cli {
 
 #[derive(Debug, Args)]
 pub struct CommonArgs {
-    /// Exact state directory (required unless forwarding with --ephemeral)
+    /// Exact state directory (required for reusable state)
     #[arg(long, short = 'd', global = true, value_name = "DIR")]
     pub directory: Option<PathBuf>,
 
-    /// Create a disposable identity in a new directory and try to delete it on exit
-    #[arg(long, global = true)]
+    /// Use a fresh temporary directory and try to delete the tunnel on exit
+    #[arg(long, global = true, conflicts_with = "directory")]
     pub ephemeral: bool,
 
     /// Extra CA certificate (PEM) to trust for the API and bridge
@@ -416,16 +416,10 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_and_directory_are_accepted() {
-        let invocation = parse(&[
-            "portable-opentunnel",
-            "3000",
-            "--ephemeral",
-            "--directory",
-            "./disposable",
-        ]);
+    fn ephemeral_uses_no_explicit_directory() {
+        let invocation = parse(&["portable-opentunnel", "3000", "--ephemeral"]);
         assert!(invocation.ephemeral);
-        assert_eq!(invocation.directory, Some(PathBuf::from("./disposable")));
+        assert!(invocation.directory.is_none());
     }
 
     #[test]

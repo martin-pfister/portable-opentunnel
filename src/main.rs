@@ -5,7 +5,6 @@ use clap::Parser;
 use portable_opentunnel::cli::{self, Action, Invocation};
 use portable_opentunnel::error::{self, AppError};
 use portable_opentunnel::forward::{self, Completed, Run};
-use portable_opentunnel::state::Mode;
 use portable_opentunnel::{directory, remove, signals, trust, url};
 
 fn main() {
@@ -79,11 +78,12 @@ fn execute(invocation: &Invocation) -> Result<Completed, AppError> {
         action @ (Action::Init | Action::Forward(_)) => {
             let trust = trust::Trust::resolve(invocation.ca_cert.clone())?;
             let run = Run {
-                state_dir: invocation.directory.clone(),
-                mode: if invocation.ephemeral {
-                    Mode::Ephemeral
+                state_dir: if invocation.ephemeral {
+                    directory::Selection::Ephemeral
                 } else {
-                    Mode::Reusable
+                    directory::Selection::Reusable(directory::require_explicit(
+                        invocation.directory.as_deref(),
+                    )?)
                 },
                 api_override: invocation.api.as_deref(),
                 ca_cert: trust.ca_cert.as_deref(),

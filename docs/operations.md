@@ -41,11 +41,11 @@ signal determines the status. A second signal forces immediate exit.
 ## State and recovery
 
 Reusable forwarding, `init`, `url`, and `delete` require `--directory DIR`.
-The argument names the exact directory. Ephemeral forwarding can omit it and
-use a fresh directory under `$TMPDIR` (or the system temporary directory).
-If you specify a path in ephemeral mode, it must not exist yet. Keep reusable
-state out of version control and on a private filesystem with reliable `flock`
-semantics, including across nodes if the directory is shared.
+The argument names the exact directory. Ephemeral forwarding does not accept
+`--directory`: it creates a fresh private directory under `$TMPDIR`, or
+`/tmp` when `TMPDIR` is unset or empty. Use `--verbose` to see the generated
+path on stderr. Keep reusable state out of version control and on a private
+filesystem with reliable `flock` semantics, including across nodes if shared.
 
 ```text
 <state>/

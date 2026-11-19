@@ -38,10 +38,7 @@ use crate::state::{self, Classification, DEFAULT_API, Mode, StateLock, WrapperMe
 
 /// Everything an invocation needs beyond its action.
 pub struct Run<'a> {
-    /// Required in reusable mode. `None` in ephemeral mode uses a fresh
-    /// directory under the temporary parent.
-    pub state_dir: Option<PathBuf>,
-    pub mode: Mode,
+    pub state_dir: directory::Selection<'a>,
     pub api_override: Option<&'a str>,
     pub ca_cert: Option<&'a Path>,
     pub startup_timeout: Duration,
@@ -155,8 +152,15 @@ pub fn random_route() -> String {
 
 impl Prepared {
     fn open(run: &Run<'_>) -> AppResult<Self> {
-        let root = directory::prepare(run.state_dir.as_deref(), run.mode)?;
+        let mode = run.state_dir.mode();
+        let root = directory::prepare(run.state_dir)?;
         state::check_private_dir(&root)?;
+        if mode == Mode::Ephemeral {
+            run.log(format!(
+                "using temporary state directory {}",
+                root.display()
+            ));
+        }
 
         // Classify after the lock, so a concurrent process cannot change the
         // outcome between the decision and the first write.
@@ -167,7 +171,7 @@ impl Prepared {
         let (meta, residue) = match classification {
             Classification::FirstRun { residue } => {
                 let api = resolve_api(None, run.api_override)?;
-                let meta = WrapperMeta::new(run.mode, api, random_route());
+                let meta = WrapperMeta::new(mode, api, random_route());
                 lock.validate()?;
                 // The route is committed before any SDK write, so an
                 // interruption can never leave an identity without its route.
@@ -175,13 +179,13 @@ impl Prepared {
                 (meta, residue)
             }
             Classification::Resumable { meta } => {
-                let meta = adopt_meta(meta, run)?;
+                let meta = adopt_meta(meta, mode, run.api_override)?;
                 lock.validate()?;
                 state::write_wrapper(&root, &meta)?;
                 (meta, Vec::new())
             }
             Classification::Initialized { meta, .. } => {
-                let meta = adopt_meta(meta, run)?;
+                let meta = adopt_meta(meta, mode, run.api_override)?;
                 if meta.api != DEFAULT_API || run.api_override.is_some() {
                     lock.validate()?;
                     state::write_wrapper(&root, &meta)?;
@@ -233,7 +237,7 @@ impl Prepared {
 
     /// Stops the invocation and, in ephemeral mode, deletes the identity.
     fn finish(&mut self, run: &Run<'_>, budget: &Budget) -> AppResult<Vec<String>> {
-        if run.mode == Mode::Reusable {
+        if self.meta.mode == Mode::Reusable {
             run.log(format!(
                 "identity kept in {}; the URL stays the same next time",
                 self.root.display()
@@ -338,15 +342,19 @@ fn warnings_with_recovery(problem: &str, root: &Path) -> Vec<String> {
 }
 
 /// Applies the mode and endpoint rules to metadata that already exists.
-fn adopt_meta(mut meta: WrapperMeta, run: &Run<'_>) -> AppResult<WrapperMeta> {
-    if meta.mode != run.mode {
+fn adopt_meta(
+    mut meta: WrapperMeta,
+    mode: Mode,
+    api_override: Option<&str>,
+) -> AppResult<WrapperMeta> {
+    if meta.mode != mode {
         return Err(AppError::fail(format!(
             "the state directory holds a {} identity; refusing to reuse it as {}",
             meta.mode.as_str(),
-            run.mode.as_str()
+            mode.as_str()
         )));
     }
-    meta.api = resolve_api(Some(&meta.api), run.api_override)?;
+    meta.api = resolve_api(Some(&meta.api), api_override)?;
     Ok(meta)
 }
 
@@ -642,16 +650,22 @@ mod tests {
 
     use crate::test_support::TempDir;
 
-    fn run_for<'a>(dir: &Path, mode: Mode, api: &'a str) -> Run<'a> {
+    fn run_for<'a>(dir: &'a Path, api: &'a str) -> Run<'a> {
         Run {
-            state_dir: Some(dir.to_path_buf()),
-            mode,
+            state_dir: directory::Selection::Reusable(dir),
             api_override: Some(api),
             ca_cert: None,
             startup_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_secs(1),
             verbose: 0,
         }
+    }
+
+    fn save_ephemeral_meta(root: &Path) -> WrapperMeta {
+        state::create_private_dir(root).unwrap();
+        let meta = WrapperMeta::new(Mode::Ephemeral, "http://127.0.0.1:1".into(), "abc".into());
+        state::write_wrapper(root, &meta).unwrap();
+        meta
     }
 
     #[test]
@@ -677,7 +691,7 @@ mod tests {
     fn the_startup_deadline_is_shared_and_never_extended() {
         let temp = TempDir::new();
         let dir = temp.path().join("state");
-        let run = run_for(&dir, Mode::Reusable, "http://127.0.0.1:1");
+        let run = run_for(&dir, "http://127.0.0.1:1");
         let deadline = startup_deadline(&run);
         let first = remaining_startup(deadline);
         assert!(first <= run.startup_timeout);
@@ -702,7 +716,7 @@ mod tests {
     fn a_marked_deletion_is_refused_instead_of_reprovisioned() {
         let temp = TempDir::new();
         let dir = temp.path().join("state");
-        let run = run_for(&dir, Mode::Reusable, "http://127.0.0.1:1");
+        let run = run_for(&dir, "http://127.0.0.1:1");
         {
             let prepared = Prepared::open(&run).unwrap();
             crate::state::mark_remote_deleted(&prepared.root, &prepared.meta).unwrap();
@@ -724,8 +738,11 @@ mod tests {
     fn confirmed_deletion_is_recorded_even_after_the_shutdown_budget_expires() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
-        let run = run_for(&root, Mode::Ephemeral, "http://127.0.0.1:1");
-        let mut prepared = Prepared::open(&run).unwrap();
+        let mut prepared = Prepared {
+            meta: save_ephemeral_meta(&root),
+            root: root.clone(),
+            lock: StateLock::acquire(&root, true).unwrap(),
+        };
         let profile = layout::profile_dir(&root);
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(
@@ -768,7 +785,7 @@ mod tests {
     fn prepared_state_commits_metadata_before_provisioning() {
         let temp = TempDir::new();
         let dir = temp.path().join("state");
-        let run = run_for(&dir, Mode::Reusable, "http://127.0.0.1:1");
+        let run = run_for(&dir, "http://127.0.0.1:1");
         let prepared = Prepared::open(&run).unwrap();
         assert!(prepared.root.join(layout::WRAPPER_FILE).exists());
         assert!(opentunnel::protocol::names::is_valid_route(
@@ -786,10 +803,10 @@ mod tests {
         let temp = TempDir::new();
         let dir = temp.path().join("state");
         {
-            let run = run_for(&dir, Mode::Reusable, "http://127.0.0.1:1");
+            let run = run_for(&dir, "http://127.0.0.1:1");
             Prepared::open(&run).unwrap();
         }
-        let other = run_for(&dir, Mode::Reusable, "http://127.0.0.1:2");
+        let other = run_for(&dir, "http://127.0.0.1:2");
         let error = Prepared::open(&other).unwrap_err();
         assert!(error.message.contains("--api"), "{}", error.message);
     }
@@ -797,19 +814,9 @@ mod tests {
     #[test]
     fn mode_cannot_change_for_an_existing_identity() {
         let temp = TempDir::new();
-        let dir = temp.path().join("state");
-        {
-            let run = run_for(&dir, Mode::Reusable, "http://127.0.0.1:1");
-            Prepared::open(&run).unwrap();
-        }
-        let ephemeral = temp.path().join("other");
-        let run = run_for(&ephemeral, Mode::Ephemeral, "http://127.0.0.1:1");
-        let prepared = Prepared::open(&run).unwrap();
-        assert_eq!(prepared.meta.mode, Mode::Ephemeral);
-        // Release the disposable run's lock before retrying it.
-        drop(prepared);
-        // Reusing that disposable directory as reusable is refused.
-        let reusable = run_for(&ephemeral, Mode::Reusable, "http://127.0.0.1:1");
+        let ephemeral = temp.path().join("ephemeral");
+        save_ephemeral_meta(&ephemeral);
+        let reusable = run_for(&ephemeral, "http://127.0.0.1:1");
         let error = Prepared::open(&reusable).unwrap_err();
         assert!(
             error.message.contains("refusing to reuse"),
@@ -829,7 +836,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
-        let run = run_for(&dir, Mode::Reusable, "http://127.0.0.1:1");
+        let run = run_for(&dir, "http://127.0.0.1:1");
         let error = Prepared::open(&run).unwrap_err();
         assert!(error.message.contains("not empty"), "{}", error.message);
     }
@@ -838,7 +845,7 @@ mod tests {
     fn a_concurrent_holder_blocks_the_second_instance() {
         let temp = TempDir::new();
         let dir = temp.path().join("state");
-        let run = run_for(&dir, Mode::Reusable, "http://127.0.0.1:1");
+        let run = run_for(&dir, "http://127.0.0.1:1");
         let held = Prepared::open(&run).unwrap();
         let error = Prepared::open(&run).unwrap_err();
         assert!(

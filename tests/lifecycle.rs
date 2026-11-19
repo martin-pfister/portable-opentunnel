@@ -79,6 +79,15 @@ impl Scratch {
     fn state(&self) -> PathBuf {
         self.path("state")
     }
+
+    /// Finds the state directory created by this test's single ephemeral run.
+    fn ephemeral_state(&self) -> PathBuf {
+        let mut entries = fs::read_dir(self.path("tmp")).unwrap();
+        let state = entries.next().expect("state under TMPDIR").unwrap().path();
+        assert!(entries.next().is_none(), "one temporary state directory");
+        assert!(state.join("wrapper.json").is_file());
+        state
+    }
 }
 
 impl Drop for Scratch {
@@ -629,6 +638,13 @@ fn spawn_forward(
     Process::spawn(scratch, &args, &[])
 }
 
+fn spawn_ephemeral(scratch: &Scratch, api: &FakeApi, target: &str, extra: &[&str]) -> Process {
+    let api_url = api.api_url();
+    let mut args = vec![target, "--ephemeral", "--api", &api_url];
+    args.extend_from_slice(extra);
+    Process::spawn(scratch, &args, &[])
+}
+
 /// `--ca-cert` arguments for a fixture whose CA is on disk.
 fn ca_args(api: &FakeApi) -> Vec<String> {
     vec!["--ca-cert".to_owned(), api.ca_path().display().to_string()]
@@ -838,30 +854,18 @@ fn persistent_forward_serves_traffic_then_keeps_identity_on_sigterm() {
 fn ephemeral_exit_deletes_remotely_and_removes_local_state() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
-    let tmp = scratch.path("tmp");
 
-    let mut process = Process::spawn(
+    let mut process = spawn_ephemeral(
         &scratch,
-        &[
-            backend.target().as_str(),
-            "--ephemeral",
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "30",
-            "--shutdown-timeout",
-            "15",
-        ],
-        &[],
+        &api,
+        &backend.target(),
+        &["--startup-timeout", "30", "--shutdown-timeout", "15"],
     );
 
     process
         .wait_line("https://", Duration::from_secs(40))
         .expect("the ephemeral tunnel must attach");
-    let mut entries = fs::read_dir(&tmp).unwrap();
-    let state = entries.next().expect("state under TMPDIR").unwrap().path();
-    assert!(state.join("wrapper.json").is_file());
-    assert!(entries.next().is_none(), "one temporary state directory");
+    let state = scratch.ephemeral_state();
     assert!(fs::read_dir(scratch.path("cwd")).unwrap().next().is_none());
     process.signal(libc::SIGTERM);
     process
@@ -1243,27 +1247,17 @@ fn delayed_refresh_cannot_recreate_deleted_state() {
     let (api, backend) = fixture(&scratch);
     // Hold every certificate GET in flight for longer than the shutdown budget.
     api.change(|behaviour| behaviour.certificate_delay = Duration::from_secs(3));
-    let state = body_dir(&scratch);
 
-    let mut process = Process::spawn(
+    let mut process = spawn_ephemeral(
         &scratch,
-        &[
-            backend.target().as_str(),
-            "--ephemeral",
-            "--directory",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "30",
-            "--shutdown-timeout",
-            "15",
-        ],
-        &[],
+        &api,
+        &backend.target(),
+        &["--startup-timeout", "30", "--shutdown-timeout", "15"],
     );
     process
         .wait_line("https://", Duration::from_secs(60))
         .expect("the ephemeral tunnel must attach");
+    let state = scratch.ephemeral_state();
 
     // Wait until a certificate GET is *actually held* by the fixture. `polls()`
     // only proves a request happened at some point; `active_refreshes()` proves
@@ -1392,20 +1386,12 @@ fn signal_during_create_response_still_saves_pending_and_deletes() {
     // Hold the create response so the signal lands after the server registered
     // the tunnel but before the client ever saw its token.
     api.change(|behaviour| behaviour.create_delay = Duration::from_secs(3));
-    let state = body_dir(&scratch);
 
-    let mut process = spawn_forward(
+    let mut process = spawn_ephemeral(
         &scratch,
         &api,
-        &state,
         &backend.target(),
-        &[
-            "--ephemeral",
-            "--startup-timeout",
-            "120",
-            "--shutdown-timeout",
-            "20",
-        ],
+        &["--startup-timeout", "120", "--shutdown-timeout", "20"],
     );
 
     // The registration exists server-side; the client has no token yet.
@@ -1415,6 +1401,7 @@ fn signal_during_create_response_still_saves_pending_and_deletes() {
         "the create request",
         || api.creates() > 0,
     );
+    let state = scratch.ephemeral_state();
     process.signal(libc::SIGTERM);
     process
         .expect_code(143, Duration::from_secs(40), "signal during create")
@@ -1440,19 +1427,11 @@ fn startup_timeout_during_create_still_saves_pending_and_deletes() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
     api.change(|behaviour| behaviour.create_delay = Duration::from_secs(3));
-    let state = body_dir(&scratch);
-    let mut process = spawn_forward(
+    let mut process = spawn_ephemeral(
         &scratch,
         &api,
-        &state,
         &backend.target(),
-        &[
-            "--ephemeral",
-            "--startup-timeout",
-            "1",
-            "--shutdown-timeout",
-            "10",
-        ],
+        &["--startup-timeout", "1", "--shutdown-timeout", "10"],
     );
 
     process
@@ -1467,7 +1446,7 @@ fn startup_timeout_during_create_still_saves_pending_and_deletes() {
     assert_eq!(api.creates(), 1);
     assert_eq!(api.deletes(), 1, "{}", process.stderr());
     assert!(api.all_deleted());
-    assert!(!state.exists());
+    assert!(fs::read_dir(scratch.path("tmp")).unwrap().next().is_none());
 }
 
 #[test]
@@ -1475,19 +1454,11 @@ fn startup_timeout_reports_an_unconfirmed_create_if_grace_expires() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
     api.change(|behaviour| behaviour.create_delay = Duration::from_secs(30));
-    let state = body_dir(&scratch);
-    let mut process = spawn_forward(
+    let mut process = spawn_ephemeral(
         &scratch,
         &api,
-        &state,
         &backend.target(),
-        &[
-            "--ephemeral",
-            "--startup-timeout",
-            "1",
-            "--shutdown-timeout",
-            "1",
-        ],
+        &["--startup-timeout", "1", "--shutdown-timeout", "1"],
     );
 
     process
@@ -1504,7 +1475,8 @@ fn startup_timeout_reports_an_unconfirmed_create_if_grace_expires() {
     );
     assert_eq!(api.creates(), 1);
     assert_eq!(api.deletes(), 0);
-    assert!(state.exists());
+    let state = scratch.ephemeral_state();
+    assert!(process.stderr().contains(&state.display().to_string()));
 }
 
 /// Each phase fits individually, but their sum exceeds the startup deadline.
@@ -1675,20 +1647,12 @@ fn sigkill_persistent_state_reopens_with_the_same_url() {
 fn sigkill_ephemeral_state_is_removable_by_explicit_delete() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
 
-    let mut process = spawn_forward(
+    let mut process = spawn_ephemeral(
         &scratch,
         &api,
-        &state,
         &backend.target(),
-        &[
-            "--ephemeral",
-            "--startup-timeout",
-            "40",
-            "--shutdown-timeout",
-            "10",
-        ],
+        &["--startup-timeout", "40", "--shutdown-timeout", "10"],
     );
     process
         .wait_line("https://", Duration::from_secs(60))
@@ -1697,10 +1661,7 @@ fn sigkill_ephemeral_state_is_removable_by_explicit_delete() {
     assert!(process.wait_exit(Duration::from_secs(20)).is_ok());
 
     // No automatic cleanup happened, so the state must still be there...
-    assert!(
-        state.join("wrapper.json").exists(),
-        "SIGKILL must leave the ephemeral state for recovery"
-    );
+    let state = scratch.ephemeral_state();
     assert_eq!(api.deletes(), 0, "SIGKILL cannot have deleted remotely");
 
     // ...and an explicit delete must remove both halves.

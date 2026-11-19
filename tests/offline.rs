@@ -410,6 +410,28 @@ fn reusable_forwarding_and_subcommands_require_a_directory() {
     scratch.assert_created_nothing();
 }
 
+#[test]
+fn ephemeral_forwarding_rejects_an_explicit_directory() {
+    let scratch = Scratch::new();
+    let output = scratch.run(&[
+        "3000",
+        "--ephemeral",
+        "--directory",
+        "./disposable",
+        "--api",
+        FIXTURE_API,
+        "--startup-timeout",
+        "1",
+        "--shutdown-timeout",
+        "1",
+    ]);
+    assert_code(&output, 2, "ephemeral forwarding with --directory");
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("--ephemeral"));
+    assert!(stderr(&output).contains("--directory"));
+    scratch.assert_created_nothing();
+}
+
 // ---------------------------------------------------------------------------
 // `url`: read-only, offline, exit 3 when nothing is initialized
 // ---------------------------------------------------------------------------
