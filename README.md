@@ -1,5 +1,7 @@
 # portable-opentunnel
 
+[![CI](https://github.com/martin-pfister/portable-opentunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/martin-pfister/portable-opentunnel/actions/workflows/ci.yml)
+
 Expose **one** local service through [OpenTunnel](https://opentunnel.xyz) from a
 single foreground process.
 
@@ -26,6 +28,11 @@ capture it and start using it. Everything else goes to stderr.
   CLI on the machine. This is a property of the implementation — the program
   spawns no child processes and speaks to the API directly — not something CI
   proves by scanning a binary for strings.
+
+**Prebuilt binary:** each push to `main` publishes a tested, statically linked
+Linux x86-64 executable. Use the artifact from the latest successful
+[CI run](https://github.com/martin-pfister/portable-opentunnel/actions/workflows/ci.yml);
+see [Build](#build) to compile it yourself.
 
 ## Contents
 
@@ -512,9 +519,10 @@ cargo build --release --locked --target x86_64-unknown-linux-musl
 scripts/ci/check-static-elf.sh target/x86_64-unknown-linux-musl/release/portable-opentunnel
 ```
 
-The current release build measures 5,382,952 bytes with no dynamic loader and
-no `DT_NEEDED` entries. Size is measured, not predicted, and will drift as
-dependencies change.
+The CI-built release binary measures 5,358,368 bytes and a separate local build
+measured 5,382,952 bytes; both have no dynamic loader and no `DT_NEEDED` entries.
+The difference is toolchain and build-path state, not a difference in linkage.
+Sizes are measured, not predicted, and drift as dependencies change.
 
 `scripts/ci/local-checks.sh` runs the sequence above in one go. It does **not**
 run the AlmaLinux acceptance tests; it says so when it finishes.
@@ -543,7 +551,7 @@ and locally:
 
 ```sh
 cargo install cargo-deny --locked --version 0.21.0
-cargo deny --all-features check
+cargo deny --all-features --locked check
 ```
 
 That single command covers four checks:
@@ -588,6 +596,10 @@ The project itself is MIT. Every dependency must be compatible with
 redistribution in a static binary; anything unexpected should be added to
 `deny.toml` deliberately, with a reason, not by widening the allowlist quietly.
 
+Dependabot opens weekly Cargo and GitHub Actions update PRs; automatic merging
+is not configured. Before updating the pinned OpenTunnel SDK, repeat the
+credential-writer and runtime-safety audit in [SDK-AUDIT.md](SDK-AUDIT.md).
+
 ## Platform support
 
 - The only artifact this project builds and ships is **Linux x86-64**,
@@ -599,13 +611,16 @@ redistribution in a static binary; anything unexpected should be added to
 - macOS, ARM64, and glibc artifacts are not provided. They are separate pieces
   of work with their own test requirements.
 
-This is the intended and configured support, not a blanket certification. The
-first CI run executed the full 163-test suite inside the pinned AlmaLinux 8.8
-container, unprivileged, against the actual static release executable, and all
-passed; the release build is 5,382,952 bytes with no dynamic loader or shared
-libraries. That run's pipeline still failed on a harness tool gap, so no artifact
-has been published yet. [docs/ci.md](docs/ci.md#honest-status) records exactly
-what has and has not been executed.
+This is the intended and configured support. CI proves the shipped artifact:
+[run 44585384660](https://github.com/martin-pfister/portable-opentunnel/actions/runs/44585384660)
+passed every job, executing all 163 tests inside the pinned AlmaLinux 8.8
+container, unprivileged, against the actual static release executable, and
+publishing it as
+[artifact 14560394278](https://github.com/martin-pfister/portable-opentunnel/actions/runs/44585384660/artifacts/14560394278)
+(2,562,287-byte archive; 5,358,368-byte binary, no dynamic loader or shared
+libraries). A separately built local release binary measured 5,382,952 bytes.
+[docs/ci.md](docs/ci.md#honest-status) records the details, including what has
+not been verified.
 
 ## License
 

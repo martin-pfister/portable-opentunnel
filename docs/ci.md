@@ -4,12 +4,10 @@ This document describes what `.github/workflows/` is configured to run, which
 container digest is pinned and why, how to reproduce the container run locally,
 and what is deliberately **not** automated.
 
-> **Read this as configuration plus recorded results.** The jobs described below
-> are what CI is set up to do. The first real run executed the full suite inside
-> the pinned AlmaLinux container and all 163 tests passed, but the pipeline
-> itself failed on a harness tool gap, so no artifact was published. The
-> [Honest status](#honest-status) section separates what was actually executed
-> from what remains unverified.
+> **Status: CI is green.** The full suite runs inside the pinned AlmaLinux 8.8
+> container, unprivileged, against the actual release executable, and every job
+> passes. Sizes, checksums, and test counts below are labelled with whether they
+> came from CI or from a local build; they are not interchangeable.
 
 Nothing here contacts the hosted OpenTunnel service. No workflow requires
 credentials, and no workflow produces tunnel identities.
@@ -203,8 +201,22 @@ Only on a push to `main`, after acceptance passes:
 Packaging re-checks static linkage, so a dynamic binary can never be published
 even if an earlier step were bypassed.
 
+The green run produced one:
+
+| | |
+| --- | --- |
+| Workflow run | [44585384660](https://github.com/martin-pfister/portable-opentunnel/actions/runs/44585384660) |
+| Artifact | [14560394278](https://github.com/martin-pfister/portable-opentunnel/actions/runs/44585384660/artifacts/14560394278) |
+| Archive size | 2,562,287 bytes |
+| Binary inside | 5,358,368 bytes (CI build) |
+
 Artifacts expire (`retention-days: 30`). There are **no** GitHub Release assets
 yet; durable release publishing on version tags is a separate decision.
+
+The CI binary and a local release build differ by a few kilobytes (5,358,368 vs
+5,382,952 bytes). The exact cause of the size difference has not been isolated.
+Both are static; the checksums and sizes quoted anywhere here
+are labelled with which build they describe.
 
 ## Pinned container
 
@@ -411,10 +423,10 @@ CARGO_HOME=$root/cargo-home "$root/install/bin/cargo-deny" \
 
 ### Source build and own test suite
 
-**First real CI run** (commit `20bb151`, workflow run `44581881071`) executed the
-complete suite inside the pinned AlmaLinux 8.8 container, unprivileged, against
-the actual release executable. **All 163 tests passed**, plus every CLI contract
-check:
+The full suite runs inside the pinned AlmaLinux 8.8 container, unprivileged,
+against the actual release executable. On the green run (commit `ea066d6`,
+workflow run [44585384660](https://github.com/martin-pfister/portable-opentunnel/actions/runs/44585384660))
+**all 163 tests passed**, plus every CLI contract check:
 
 ```
 library     114
@@ -425,16 +437,10 @@ fixture       7
 total       163   all passed
 ```
 
-The static build, static-linkage checks, and the dependency job were green too.
+The static build, the static-linkage verification of every test executable and
+the release binary, and the dependency job were green in the same run.
 
-That run's **overall pipeline still failed**, in this harness rather than in the
-program: `run-acceptance.sh` called `diff`, which a minimal AlmaLinux image does
-not ship (it comes from diffutils). The comparison now uses `comm` from
-coreutils, with a preflight that fails clearly if a required tool is absent. The
-artifact upload is gated behind this job, so no release artifact was published;
-it will be on the next successful run.
-
-Locally, before that run, the same suites reported:
+Locally, the same suites report matching numbers:
 
 ```
 library tests:   114 passed; 0 failed
@@ -445,7 +451,12 @@ fixture tests:     7 passed
 Those local runs used a `TMPDIR` inside the project, because this development
 sandbox blocks `.pem` writes in `/tmp`; the tests create certificate fixtures, so
 a `/tmp`-based `TMPDIR` fails with `EACCES` for reasons unrelated to the code. CI
-has no such restriction and ran the lifecycle suite fully.
+has no such restriction.
+
+A first run (commit `20bb151`) passed the same 163 tests but failed the pipeline
+on a harness bug: the script called `diff`, which a minimal AlmaLinux image does
+not ship. The comparison now uses `comm` from coreutils, with a preflight that
+fails clearly when a required tool is missing. That was never a program failure.
 
 Two notes on coverage:
 
@@ -463,25 +474,41 @@ A skip is therefore visible, never silent, and never a stand-in for a pass.
 
 ### Release executable
 
-The static musl release build was verified directly:
+**The CI artifact's binary is the authoritative one.** The run above verified
+every test executable *and* that release binary as static (no `PT_INTERP`, no
+`DT_NEEDED`) before upload:
 
 | | |
 | --- | --- |
-| Size | 5,382,952 bytes |
+| Binary in the CI artifact | 5,358,368 bytes |
+| Archive | 2,562,287 bytes |
+
+A separate build was also verified locally:
+
+| | |
+| --- | --- |
+| Local release build | 5,382,952 bytes |
 | SHA-256 | `908b61f2104d8365fbce8db940221f8f881ec0c5353dde297cd351891287ac10` |
 | Loader / shared libraries | none: no `PT_INTERP`, no `DT_NEEDED` |
 
-Its offline CLI suite passes 20/20.
+The two were built in different environments; the size difference has not been
+investigated further. The checksum above describes the local build only; it is not
+the artifact's checksum.
 
-Locally, the lifecycle suite against the **release** executable passed 20 of 22;
-the two failures were `localhost` DNS lookups denied by this development sandbox,
-not SDK or program behavior. A minimal C probe showed static musl
-`getaddrinfo("localhost")` returning `EAI_SYSTEM`/`EACCES` here while glibc
-succeeds, and `/etc/hosts` in this environment has no `localhost` mapping. The
-hostname assertions were left strict rather than relaxed, and in CI — which has a
-real `localhost` mapping and the controlled hostname — all 22 passed.
+That local build's offline CLI suite passed 20/20. Locally, the lifecycle suite
+against the release executable passed 20 of 22; the two failures were `localhost`
+DNS lookups denied by this development sandbox, not SDK or program behavior. A
+minimal C probe showed static musl `getaddrinfo("localhost")` returning
+`EAI_SYSTEM`/`EACCES` here while glibc succeeds, and `/etc/hosts` in this
+environment has no `localhost` mapping. The hostname assertions were left strict
+rather than relaxed, and in CI — which has a real `localhost` mapping and the
+controlled hostname — all 22 passed.
 
-To reproduce:
+The artifact has not been downloaded and re-verified by hand: the Azure blob host
+that serves Actions artifacts is blocked from this environment. Its size and the
+in-container verification above come from the workflow itself.
+
+To reproduce the local checks:
 
 ```sh
 cargo test --locked
