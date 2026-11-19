@@ -275,7 +275,7 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/release"
           tag="build-$GITHUB_RUN_NUMBER"
-          stem="portable-opentunnel-$tag-$MUSL_TARGET"
+          stem=portable-opentunnel-linux-x86_64
           archive="$stem.tar.gz"
           checksum="$archive.sha256"
           metadata="$stem.metadata.json"
@@ -308,8 +308,8 @@ jobs:
             gh release create "$tag" --verify-tag --draft --title "$tag" \
               --notes "Automated build of \`$GITHUB_SHA\`. [CI and acceptance results]($run_url)."
           fi
-          # Retry incomplete uploads only on a draft. Published assets are never replaced.
-          gh release upload "$tag" --clobber "$archive" "$checksum" "$metadata"
+          # Retry incomplete uploads only on a draft. Metadata stays in the CI artifact.
+          gh release upload "$tag" --clobber "$archive" "$checksum"
 
           if ! latest=$(gh api "repos/$GH_REPO/releases/latest" --jq '.tag_name' 2>&1); then
             if [[ "$latest" != *"(HTTP 404)"* ]]; then

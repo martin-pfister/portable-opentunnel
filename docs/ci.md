@@ -125,12 +125,15 @@ writable scratch directory, and runs acceptance inside the pinned image.
 ## Automatic releases on `main`
 
 On pushes to `main`, acceptance packages the tested binary as
-`portable-opentunnel-build-<number>-x86_64-unknown-linux-musl.tar.gz`, along
-with its `.tar.gz.sha256` checksum and `.metadata.json` build record.
-The publishing job downloads the accepted package by artifact ID, verifies
-it, tags the tested commit as `build-<number>`, and publishes after all assets
-are uploaded. The Actions artifact expires after 30 days; the release assets
-do not share that retention limit.
+`portable-opentunnel-linux-x86_64.tar.gz`, alongside
+`portable-opentunnel-linux-x86_64.tar.gz.sha256`. These two public asset names
+stay the same across releases; the build number is in the release tag.
+
+The publishing job downloads the accepted package by artifact ID and verifies
+the checksum and internal `portable-opentunnel-linux-x86_64.metadata.json`.
+It tags the tested commit as `build-<number>` and publishes after uploading
+the archive and checksum. The Actions artifact, including the metadata,
+expires after 30 days; the release assets do not share that retention limit.
 
 Build numbers come from `github.run_number`, so failed and non-release runs
 can leave gaps. The Cargo version stays unchanged. Reruns can finish a draft

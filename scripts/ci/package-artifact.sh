@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Package a release executable with the metadata required by the release
-# contract: versioned archive, SHA-256 checksum, commit identifier, target
+# contract: fixed-name archive, SHA-256 checksum, build version, commit, target
 # triple, and the actual byte size. It also re-checks static linkage so an
 # artifact is never published with a hidden dynamic loader.
 #
 # Usage:
 #   package-artifact.sh --binary PATH --target TRIPLE --outdir DIR [--version VERSION]
 #
+# The release target is x86_64-unknown-linux-musl.
 # --version defaults to `cargo metadata`'s package version when Cargo metadata
 # is available, otherwise to "0.0.0-unknown". Commit and build metadata come from
 # the environment when set: GITHUB_SHA (fallback: git rev-parse HEAD) and
@@ -35,6 +36,10 @@ done
 [[ -n $binary ]] || { echo "package-artifact: --binary is required" >&2; exit 2; }
 [[ -n $target ]] || { echo "package-artifact: --target is required" >&2; exit 2; }
 [[ -n $outdir ]] || { echo "package-artifact: --outdir is required" >&2; exit 2; }
+[[ $target == x86_64-unknown-linux-musl ]] || {
+  echo "package-artifact: unsupported release target: $target" >&2
+  exit 2
+}
 [[ -f $binary ]] || { echo "package-artifact: missing binary: $binary" >&2; exit 1; }
 
 if [[ -z $version ]]; then
@@ -50,7 +55,7 @@ fi
 [[ -n $commit ]] || commit=unknown
 
 name=portable-opentunnel
-archive="$name-$version-$target"
+archive="$name-linux-x86_64"
 size=$(stat -c '%s' "$binary")
 
 mkdir -p "$outdir"
