@@ -51,6 +51,21 @@ mkdir -p "$scratch"
 # relative scratch path would silently fail to match and get flagged as a leak.
 scratch=$(cd -- "$scratch" && pwd)
 
+# ---------------------------------------------------------------- preflight
+# Fail early and clearly when a tool this script depends on is absent, rather
+# than partway through with a confusing error. A minimal AlmaLinux image has
+# coreutils (comm, sort, wc, sed, grep) but not diffutils, so `diff` is
+# deliberately not in this list and is not used anywhere below.
+missing_tools=
+for tool in find sort comm wc sed grep mktemp; do
+  command -v "$tool" >/dev/null 2>&1 || missing_tools="$missing_tools $tool"
+done
+if [[ -n $missing_tools ]]; then
+  echo "run-acceptance: required tools missing:$missing_tools" >&2
+  echo "run-acceptance: the acceptance image is expected to provide coreutils, findutils, sed, and grep" >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------- loopback
 # The run normally uses `--network none`. Tests bind loopback fixtures, so a
 # dead `lo` would turn every test into a confusing bind error. A closed port
@@ -179,8 +194,9 @@ export PORTABLE_OPENTUNNEL_TEST_BINARY_USED="$scratch/release-binary-used.log"
 # localhost, which resolves without any external DNS either way. It is forwarded
 # explicitly because the test environment below is built with `env -i`.
 test_host=${PORTABLE_OPENTUNNEL_TEST_HOST:-localhost}
-# These must not leak from the host into the test environment.
-unset CARGO_BIN_EXE_portable-opentunnel || true
+# `CARGO_BIN_EXE_portable-opentunnel` needs no unsetting: it is a compile-time
+# variable baked into the test binary, never a runtime one, and the `env -i`
+# below already produces a clean environment.
 
 while IFS=$'\t' read -r name path; do
   [[ -n ${path:-} ]] || continue
@@ -242,11 +258,32 @@ fi
 echo "run-acceptance: comparing the filesystem snapshot"
 snapshot > "$after"
 unexpected="$scratch/.fs-diff"
-if LC_ALL=C diff -u "$before" "$after" > "$unexpected"; then
+# `diff` is not present in a minimal AlmaLinux image (it comes from diffutils,
+# which the image does not include), so the comparison uses `comm`, which ships
+# with coreutils. Both snapshots are already sorted with `LC_ALL=C sort -u`,
+# which is exactly what `comm` requires; `-3` suppresses lines common to both
+# files, leaving only the differences.
+#
+# The exit status is checked separately from the output, so a `comm` failure is
+# reported as a harness error rather than being mistaken for a filesystem
+# change.
+compare_status=0
+LC_ALL=C comm -3 "$before" "$after" > "$unexpected" || compare_status=$?
+if [[ $compare_status -ne 0 ]]; then
+  echo "run-acceptance: FAILED: could not compare snapshots (comm exit $compare_status)" >&2
+  failures=$((failures + 1))
+elif [[ ! -s $unexpected ]]; then
   echo "run-acceptance: no persistent changes found in the monitored paths"
 else
   echo "run-acceptance: FAILED: persistent changes in monitored paths:" >&2
-  grep -E '^[+-][^+-]' "$unexpected" | sed 's/^/run-acceptance:   /' >&2 || true
+  # Label the two directions so a reader can tell an appearing entry from a
+  # disappearing one: `comm -23` is only-in-before, `comm -13` only-in-after.
+  removed="$scratch/.fs-removed"
+  added="$scratch/.fs-added"
+  LC_ALL=C comm -23 "$before" "$after" > "$removed" || true
+  LC_ALL=C comm -13 "$before" "$after" > "$added" || true
+  sed 's/^/run-acceptance:   removed:  /' "$removed" >&2 || true
+  sed 's/^/run-acceptance:   appeared: /' "$added" >&2 || true
   failures=$((failures + 1))
 fi
 

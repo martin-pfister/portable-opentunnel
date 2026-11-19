@@ -599,13 +599,13 @@ redistribution in a static binary; anything unexpected should be added to
 - macOS, ARM64, and glibc artifacts are not provided. They are separate pieces
   of work with their own test requirements.
 
-This is the intended and configured support, not a record of results. The
-release executable has been built and checked locally (Linux x86-64, static
-musl, 5,382,952 bytes, no dynamic loader or shared libraries), but the AlmaLinux
-acceptance run happens only in CI and had not yet run. Treat the artifact as
-verified-for-static-linkage but not yet acceptance-tested there.
-[docs/ci.md](docs/ci.md#honest-status) records exactly what has and has not been
-executed.
+This is the intended and configured support, not a blanket certification. The
+first CI run executed the full 163-test suite inside the pinned AlmaLinux 8.8
+container, unprivileged, against the actual static release executable, and all
+passed; the release build is 5,382,952 bytes with no dynamic loader or shared
+libraries. That run's pipeline still failed on a harness tool gap, so no artifact
+has been published yet. [docs/ci.md](docs/ci.md#honest-status) records exactly
+what has and has not been executed.
 
 ## License
 

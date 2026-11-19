@@ -4,11 +4,12 @@ This document describes what `.github/workflows/` is configured to run, which
 container digest is pinned and why, how to reproduce the container run locally,
 and what is deliberately **not** automated.
 
-> **Read this as configuration plus local results.** The jobs described below
-> are what CI is set up to do. At the time of writing the AlmaLinux acceptance
-> run had not happened in CI yet, so no description of a job here should be read
-> as evidence that it passed. The [Honest status](#honest-status) section
-> separates what was actually executed locally from what remains unverified.
+> **Read this as configuration plus recorded results.** The jobs described below
+> are what CI is set up to do. The first real run executed the full suite inside
+> the pinned AlmaLinux container and all 163 tests passed, but the pipeline
+> itself failed on a harness tool gap, so no artifact was published. The
+> [Honest status](#honest-status) section separates what was actually executed
+> from what remains unverified.
 
 Nothing here contacts the hosted OpenTunnel service. No workflow requires
 credentials, and no workflow produces tunnel identities.
@@ -410,7 +411,30 @@ CARGO_HOME=$root/cargo-home "$root/install/bin/cargo-deny" \
 
 ### Source build and own test suite
 
-The crate builds, and the tests pass in a debug build. Locally:
+**First real CI run** (commit `20bb151`, workflow run `44581881071`) executed the
+complete suite inside the pinned AlmaLinux 8.8 container, unprivileged, against
+the actual release executable. **All 163 tests passed**, plus every CLI contract
+check:
+
+```
+library     114
+lifecycle    22
+offline      20
+fixture       7
+-------------
+total       163   all passed
+```
+
+The static build, static-linkage checks, and the dependency job were green too.
+
+That run's **overall pipeline still failed**, in this harness rather than in the
+program: `run-acceptance.sh` called `diff`, which a minimal AlmaLinux image does
+not ship (it comes from diffutils). The comparison now uses `comm` from
+coreutils, with a preflight that fails clearly if a required tool is absent. The
+artifact upload is gated behind this job, so no release artifact was published;
+it will be on the next successful run.
+
+Locally, before that run, the same suites reported:
 
 ```
 library tests:   114 passed; 0 failed
@@ -418,10 +442,10 @@ lifecycle tests:  22 passed; 0 failed
 fixture tests:     7 passed
 ```
 
-That run used a `TMPDIR` inside the project, because this development sandbox
-blocks `.pem` writes in `/tmp`; the tests create certificate fixtures, so a
-`/tmp`-based `TMPDIR` fails with `EACCES` for reasons unrelated to the code. On
-an ordinary machine the default `TMPDIR` works.
+Those local runs used a `TMPDIR` inside the project, because this development
+sandbox blocks `.pem` writes in `/tmp`; the tests create certificate fixtures, so
+a `/tmp`-based `TMPDIR` fails with `EACCES` for reasons unrelated to the code. CI
+has no such restriction and ran the lifecycle suite fully.
 
 Two notes on coverage:
 
@@ -449,15 +473,13 @@ The static musl release build was verified directly:
 
 Its offline CLI suite passes 20/20.
 
-The lifecycle suite against the **release** executable passes 20 of 22. The
-two remaining failures are `localhost` DNS lookups denied by this development sandbox,
-not SDK or program behavior: a minimal C probe shows static musl
+Locally, the lifecycle suite against the **release** executable passed 20 of 22;
+the two failures were `localhost` DNS lookups denied by this development sandbox,
+not SDK or program behavior. A minimal C probe showed static musl
 `getaddrinfo("localhost")` returning `EAI_SYSTEM`/`EACCES` here while glibc
-succeeds, `/etc/hosts` in this environment has no `localhost` mapping, and a
-mapped name resolves fine. The hostname assertions remain strict. The HTTPS
-fixture uses its certificate's loopback-IP SAN to test CA trust independently
-of DNS. CI supplies a real `localhost` mapping and the controlled hostname, so
-these tests do not need DNS there; its acceptance result is still pending.
+succeeds, and `/etc/hosts` in this environment has no `localhost` mapping. The
+hostname assertions were left strict rather than relaxed, and in CI — which has a
+real `localhost` mapping and the controlled hostname — all 22 passed.
 
 To reproduce:
 
@@ -467,12 +489,6 @@ cargo test --locked
 
 ### Not tested here
 
-- **The AlmaLinux 8.8 container run.** No container runtime is available here,
-  and the project's constraint is that CI is the only place it runs. Everything
-  about the acceptance run is therefore configuration plus script-level tests,
-  not an end-to-end result.
-- **`run-ci-container.sh`** (needs a real runtime) and **the workflows
-  themselves** (need a GitHub runner).
-
-The first push to `main` or the first pull request is what actually executes the
-build and container gates.
+- **`run-ci-container.sh`** (needs a real container runtime) and **the
+  `diagnostics` workflow** (needs a GitHub runner). The `ci` workflow itself has
+  run, with the result recorded above.
