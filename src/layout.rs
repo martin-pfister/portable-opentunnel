@@ -195,7 +195,6 @@ mod tests {
         assert_eq!(root_entry("wrapper.json"), RootEntry::Wrapper);
         assert_eq!(root_entry("sdk"), RootEntry::SdkDir);
         assert_eq!(root_entry("wrapper.json.tmp-9-abc"), RootEntry::WrapperTemp);
-        assert_eq!(root_entry(".portable-opentunnel"), RootEntry::Unknown);
         assert_eq!(root_entry("token"), RootEntry::Unknown);
     }
 }

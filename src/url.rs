@@ -15,16 +15,8 @@ use crate::state::{self, Classification};
 
 /// Runs `url` and returns the URL to print, or an error carrying the exit
 /// status: 3 when nothing is initialized, 1 for anything operational.
-pub fn run(directory: Option<&Path>) -> AppResult<String> {
-    let root = match directory {
-        Some(path) => directory::absolutize(path),
-        None => directory::default_directory()?,
-    };
-    // A missing directory is simply "not initialized": never create it.
-    if !root.exists() {
-        return Err(AppError::no_tunnel(not_initialized(&root)));
-    }
-
+pub fn run(directory: &Path) -> AppResult<String> {
+    let root = directory::absolutize(directory);
     let classification = state::classify(&root)?;
     match classification {
         Classification::Initialized { meta, hostname } => {
@@ -81,14 +73,14 @@ mod tests {
         let temp = TempDir::new();
         let root = temp.path().join("state");
         initialized(&root, "abc", "abc.opentunnel.xyz");
-        assert_eq!(run(Some(&root)).unwrap(), "https://abc.abc.opentunnel.xyz");
+        assert_eq!(run(&root).unwrap(), "https://abc.abc.opentunnel.xyz");
     }
 
     #[test]
     fn missing_directory_is_not_initialized_and_is_not_created() {
         let temp = TempDir::new();
         let root = temp.path().join("absent");
-        let error = run(Some(&root)).unwrap_err();
+        let error = run(&root).unwrap_err();
         assert_eq!(error.code, crate::error::NO_TUNNEL);
         assert!(error.message.starts_with("No tunnel initialized in"));
         assert!(!root.exists(), "url must not create the directory");
@@ -99,7 +91,7 @@ mod tests {
         let temp = TempDir::new();
         let root = temp.path().join("state");
         state::create_private_dir(&root).unwrap();
-        assert_eq!(run(Some(&root)).unwrap_err().code, crate::error::NO_TUNNEL);
+        assert_eq!(run(&root).unwrap_err().code, crate::error::NO_TUNNEL);
     }
 
     #[test]
@@ -108,7 +100,7 @@ mod tests {
         let root = temp.path().join("state");
         state::create_private_dir(&root).unwrap();
         fs::write(root.join("wrapper.json.tmp-1-abc"), b"{}").unwrap();
-        let error = run(Some(&root)).unwrap_err();
+        let error = run(&root).unwrap_err();
         assert_eq!(error.code, crate::error::NO_TUNNEL);
         assert!(
             root.join("wrapper.json.tmp-1-abc").exists(),
@@ -126,7 +118,7 @@ mod tests {
             &WrapperMeta::new(Mode::Reusable, DEFAULT_API.to_owned(), "abc".to_owned()),
         )
         .unwrap();
-        assert_eq!(run(Some(&root)).unwrap_err().code, crate::error::NO_TUNNEL);
+        assert_eq!(run(&root).unwrap_err().code, crate::error::NO_TUNNEL);
     }
 
     #[test]
@@ -135,7 +127,7 @@ mod tests {
         let root = temp.path().join("state");
         state::create_private_dir(&root).unwrap();
         fs::write(root.join(layout::WRAPPER_FILE), b"{oops").unwrap();
-        assert_eq!(run(Some(&root)).unwrap_err().code, crate::error::FAILURE);
+        assert_eq!(run(&root).unwrap_err().code, crate::error::FAILURE);
     }
 
     #[test]
@@ -145,7 +137,7 @@ mod tests {
         let profile = layout::profile_dir(&root);
         fs::create_dir_all(&profile).unwrap();
         fs::write(profile.join(layout::TUNNEL), b"{}").unwrap();
-        assert_eq!(run(Some(&root)).unwrap_err().code, crate::error::FAILURE);
+        assert_eq!(run(&root).unwrap_err().code, crate::error::FAILURE);
     }
 
     #[test]
@@ -153,6 +145,6 @@ mod tests {
         let temp = TempDir::new();
         let root = temp.path().join("state");
         initialized(&root, "@", "abc.opentunnel.xyz");
-        assert_eq!(run(Some(&root)).unwrap(), "https://abc.opentunnel.xyz");
+        assert_eq!(run(&root).unwrap(), "https://abc.opentunnel.xyz");
     }
 }

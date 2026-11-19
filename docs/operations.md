@@ -40,11 +40,12 @@ signal determines the status. A second signal forces immediate exit.
 
 ## State and recovery
 
-The state directory is the exact path given to `--directory`, or
-`$PWD/.portable-opentunnel` by default. Ephemeral mode uses a new path under
-`$TMPDIR` (or the system temporary directory) unless you give it a new path.
-Keep reusable state on a private filesystem with reliable `flock` semantics,
-including across nodes if the directory is shared.
+Reusable forwarding, `init`, `url`, and `delete` require `--directory DIR`.
+The argument names the exact directory. Ephemeral forwarding can omit it and
+use a fresh directory under `$TMPDIR` (or the system temporary directory).
+If you specify a path in ephemeral mode, it must not exist yet. Keep reusable
+state out of version control and on a private filesystem with reliable `flock`
+semantics, including across nodes if the directory is shared.
 
 ```text
 <state>/

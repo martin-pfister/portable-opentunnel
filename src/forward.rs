@@ -29,7 +29,7 @@ use crate::bridge::{self, Provisioned};
 use crate::budget::Budget;
 use crate::cleanup;
 use crate::cli::Target;
-use crate::directory::{self, Kind};
+use crate::directory;
 use crate::error::{AppError, AppResult};
 use crate::layout;
 use crate::remote;
@@ -38,8 +38,8 @@ use crate::state::{self, Classification, DEFAULT_API, Mode, StateLock, WrapperMe
 
 /// Everything an invocation needs beyond its action.
 pub struct Run<'a> {
-    /// `None` means "choose one": `$PWD/.portable-opentunnel` for reusable
-    /// state, a fresh directory under `$TMPDIR` for ephemeral state.
+    /// Required in reusable mode. `None` in ephemeral mode uses a fresh
+    /// directory under the temporary parent.
     pub state_dir: Option<PathBuf>,
     pub mode: Mode,
     pub api_override: Option<&'a str>,
@@ -155,12 +155,7 @@ pub fn random_route() -> String {
 
 impl Prepared {
     fn open(run: &Run<'_>) -> AppResult<Self> {
-        let kind = match run.mode {
-            Mode::Reusable => Kind::Reusable,
-            Mode::Ephemeral => Kind::Ephemeral,
-        };
-        let chosen = directory::prepare(run.state_dir.as_deref(), kind)?;
-        let root = chosen.path;
+        let root = directory::prepare(run.state_dir.as_deref(), run.mode)?;
         state::check_private_dir(&root)?;
 
         // Classify after the lock, so a concurrent process cannot change the
@@ -738,18 +733,18 @@ mod tests {
             br#"{"hostname":"abc.opentunnel.xyz"}"#,
         )
         .unwrap();
-        assert!(crate::url::run(Some(&root)).is_ok());
+        assert!(crate::url::run(&root).is_ok());
 
         let warnings = prepared.finish_local(&Budget::new(Duration::ZERO)).unwrap();
         assert!(warnings[0].contains("marked for resumption"));
         assert!(profile.join(layout::TUNNEL).exists());
         assert_eq!(
-            crate::url::run(Some(&root)).unwrap_err().code,
+            crate::url::run(&root).unwrap_err().code,
             crate::error::NO_TUNNEL
         );
 
         drop(prepared);
-        crate::remove::run(Some(&root), None, None, Duration::ZERO, 0).unwrap();
+        crate::remove::run(&root, None, None, Duration::ZERO, 0).unwrap();
         assert!(
             !root.exists(),
             "a marked deletion can finish without network"

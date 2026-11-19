@@ -100,8 +100,7 @@ impl Scratch {
         self.path("tmp")
     }
 
-    /// The child's working directory: nothing the program might create by
-    /// default may appear here unless a test expects it.
+    /// The child's working directory, also used for relative path arguments.
     fn cwd(&self) -> PathBuf {
         self.path("cwd")
     }
@@ -120,7 +119,6 @@ impl Scratch {
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.home())
             .env("TMPDIR", self.tmp())
-            .env("PWD", self.cwd())
             .env("XDG_DATA_HOME", self.path("xdg-data"))
             .env("XDG_CONFIG_HOME", self.path("xdg-config"))
             .env("XDG_STATE_HOME", self.path("xdg-state"))
@@ -132,24 +130,13 @@ impl Scratch {
             .unwrap_or_else(|error| panic!("running {}: {error}", binary().display()))
     }
 
-    /// Asserts that a rejected invocation left the filesystem alone: no
-    /// default state directory in the working directory and nothing in
-    /// `TMPDIR`.
+    /// Asserts that a rejected invocation left the working directory and
+    /// `TMPDIR` empty.
     fn assert_created_nothing(&self) {
-        let default = self.cwd().join(".portable-opentunnel");
-        assert!(
-            !default.exists(),
-            "a rejected invocation created {}",
-            default.display()
-        );
-        let entries: Vec<_> = fs::read_dir(self.tmp())
-            .expect("reading the scratch TMPDIR")
-            .map(|entry| entry.expect("reading a TMPDIR entry").file_name())
-            .collect();
-        assert!(
-            entries.is_empty(),
-            "a rejected invocation created entries under TMPDIR: {entries:?}"
-        );
+        for dir in [self.cwd(), self.tmp()] {
+            let mut entries = fs::read_dir(&dir).expect("reading the scratch directory");
+            assert!(entries.next().is_none(), "{} is not empty", dir.display());
+        }
     }
 }
 
@@ -358,9 +345,12 @@ fn incompatible_flag_combinations_are_rejected_with_exit_2() {
         (&["init", "3000"], "init with a target"),
         (&["url", "3000"], "url with a target"),
         (&["delete", "3000"], "delete with a target"),
-        (&["3000", "--startup-timeout", "0"], "zero startup timeout"),
         (
-            &["3000", "--shutdown-timeout", "0"],
+            &["3000", "-d", "./state", "--startup-timeout", "0"],
+            "zero startup timeout",
+        ),
+        (
+            &["3000", "-d", "./state", "--shutdown-timeout", "0"],
             "zero shutdown timeout",
         ),
         (&["3000", "--no-such-flag"], "unknown flag"),
@@ -389,8 +379,33 @@ fn the_api_override_must_be_a_bare_origin() {
         "http://127.0.0.1:8080/?query=1",
         "file:///tmp/socket",
     ] {
-        let output = scratch.run(&["url", "--api", api]);
+        let output = scratch.run(&["url", "-d", "./state", "--api", api]);
         assert_code(&output, 2, &format!("--api {api:?}"));
+        assert!(stderr(&output).contains("invalid --api"));
+    }
+    scratch.assert_created_nothing();
+}
+
+#[test]
+fn reusable_forwarding_and_subcommands_require_a_directory() {
+    let scratch = Scratch::new();
+    for action in ["3000", "init", "url", "delete"] {
+        let output = scratch.run(&[
+            action,
+            "--api",
+            FIXTURE_API,
+            "--startup-timeout",
+            "1",
+            "--shutdown-timeout",
+            "1",
+        ]);
+        assert_code(&output, 2, action);
+        assert!(stdout(&output).is_empty());
+        assert!(
+            stderr(&output).contains("--directory DIR is required"),
+            "{}",
+            stderr(&output)
+        );
     }
     scratch.assert_created_nothing();
 }
@@ -421,29 +436,12 @@ fn url_missing_directory_exits_3_and_creates_nothing() {
 }
 
 #[test]
-fn url_default_directory_missing_exits_3_without_creating_it() {
-    let scratch = Scratch::new();
-
-    let output = scratch.run(&["url"]);
-    assert_code(&output, 3, "url with the default directory");
-    assert!(stdout(&output).is_empty());
-
-    let default = scratch.cwd().join(".portable-opentunnel");
-    assert!(
-        !default.exists(),
-        "url created the default state directory at {}",
-        default.display()
-    );
-    scratch.assert_created_nothing();
-}
-
-#[test]
 fn url_prints_the_saved_url_without_reading_credentials() {
     let scratch = Scratch::new();
-    let state = scratch.path("state");
+    let state = scratch.cwd().join("state");
     initialized(&state, "abc123", "abc.opentunnel.xyz");
 
-    let output = scratch.run(&["url", "--directory", state.to_str().unwrap()]);
+    let output = scratch.run(&["url", "--directory", "./state"]);
     assert_code(&output, 0, "url on an initialized directory");
     assert_eq!(
         stdout(&output).trim_end(),

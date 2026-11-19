@@ -27,7 +27,7 @@ userland, not on the original AlmaLinux kernel. To build from source, see the
 Start your application first. For a service listening on `127.0.0.1:3000`:
 
 ```console
-$ ./portable-opentunnel 3000
+$ ./portable-opentunnel 3000 --directory ./my-tunnel
 https://k3f9x2m1q7zt.abcd1234.opentunnel.xyz
 ```
 
@@ -35,6 +35,7 @@ A bare port uses `127.0.0.1`; `host:port` and `[IPv6]:port` also work. The URL
 is printed on stdout once the tunnel attaches. That tells you the tunnel is
 connected, not that your application is healthy. Diagnostics go to stderr.
 Press Ctrl+C to stop forwarding.
+For a throwaway URL, use `./portable-opentunnel 3000 --ephemeral`.
 
 **The URL is public.** Only expose services intended to be reachable from the
 internet, and configure application authentication if needed.
@@ -43,14 +44,14 @@ internet, and configure application authentication if needed.
 
 | Mode | State directory | On exit |
 | --- | --- | --- |
-| Reusable (default) | `$PWD/.portable-opentunnel`, or a private `--directory DIR` you choose | Keeps the identity and URL, even if the local target changes next time |
+| Reusable | Requires a private `--directory DIR` you choose | Keeps the identity and URL, even if the local target changes next time |
 | `--ephemeral` | Fresh private directory under `$TMPDIR`, or a `--directory DIR` that **does not exist yet** | Tries to delete the registration and local state |
 
 Give concurrent jobs separate directories. Only one process can modify a given
 state directory at a time, and shared storage must provide reliable cross-node
 locking.
 
-Other commands accept `--directory` too:
+`init`, `url`, and `delete` also require `--directory`:
 
 ```sh
 ./portable-opentunnel init   --directory ./my-tunnel  # create an identity, without forwarding

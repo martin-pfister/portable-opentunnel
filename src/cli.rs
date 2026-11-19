@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
+use crate::directory;
 use crate::error::{AppError, AppResult};
 
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -21,12 +22,12 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
         The identity and its random route are saved in the state directory, so the public HTTPS URL \
         stays the same between runs even when the local target changes.",
     after_help = "EXAMPLES:\n  \
-        portable-opentunnel 3000\n  \
+        portable-opentunnel 3000 --directory ./my-tunnel\n  \
         portable-opentunnel 127.0.0.1:8080 --directory /shared/private/my-tunnel\n  \
         portable-opentunnel 3000 --ephemeral\n  \
         portable-opentunnel init --directory ./my-tunnel\n  \
         portable-opentunnel url --directory ./my-tunnel\n  \
-        portable-opentunnel delete\n\n\
+        portable-opentunnel delete --directory ./my-tunnel\n\n\
         EXIT STATUS:\n  \
         0 success; 1 operational failure; 2 invalid arguments; 3 no initialized identity;\n  \
         130 after SIGINT; 143 after SIGTERM"
@@ -45,7 +46,7 @@ pub struct Cli {
 
 #[derive(Debug, Args)]
 pub struct CommonArgs {
-    /// Exact state directory (default: $PWD/.portable-opentunnel)
+    /// Exact state directory (required unless forwarding with --ephemeral)
     #[arg(long, short = 'd', global = true, value_name = "DIR")]
     pub directory: Option<PathBuf>,
 
@@ -272,6 +273,10 @@ impl Cli {
             }
         };
 
+        if !common.ephemeral {
+            directory::require_explicit(common.directory.as_deref())?;
+        }
+
         let startup_timeout = Duration::from_secs(common.startup_timeout);
         if startup_timeout.is_zero() {
             return Err(AppError::new(
@@ -353,7 +358,7 @@ mod tests {
 
     #[test]
     fn bare_port_targets_loopback() {
-        let invocation = parse(&["portable-opentunnel", "3000"]);
+        let invocation = parse(&["portable-opentunnel", "3000", "-d", "./state"]);
         assert_eq!(
             invocation.action,
             Action::Forward(Target {
@@ -462,10 +467,12 @@ mod tests {
 
     #[test]
     fn zero_timeouts_are_rejected() {
-        let cli = Cli::try_parse_from(["p", "3000", "--startup-timeout", "0"]).unwrap();
-        assert_eq!(cli.resolve().unwrap_err().code, 2);
-        let cli = Cli::try_parse_from(["p", "3000", "--shutdown-timeout", "0"]).unwrap();
-        assert_eq!(cli.resolve().unwrap_err().code, 2);
+        for flag in ["--startup-timeout", "--shutdown-timeout"] {
+            let cli = Cli::try_parse_from(["p", "3000", "-d", "./state", flag, "0"]).unwrap();
+            let error = cli.resolve().unwrap_err();
+            assert_eq!(error.code, 2);
+            assert!(error.message.contains(flag), "{error}");
+        }
     }
 
     #[test]
@@ -473,6 +480,8 @@ mod tests {
         let invocation = parse(&[
             "portable-opentunnel",
             "3000",
+            "-d",
+            "./state",
             "--startup-timeout",
             "30",
             "--shutdown-timeout",
@@ -484,22 +493,16 @@ mod tests {
 
     #[test]
     fn api_override_is_validated() {
-        assert_eq!(
-            parse(&["p", "3000", "--api", "http://127.0.0.1:1"])
-                .api
-                .as_deref(),
-            Some("http://127.0.0.1:1")
-        );
-        assert_eq!(
-            parse(&["p", "3000", "--api", "http://127.0.0.1:1/"])
-                .api
-                .as_deref(),
-            Some("http://127.0.0.1:1/")
-        );
-        let cli = Cli::try_parse_from(["p", "3000", "--api", "ftp://host"]).unwrap();
-        assert_eq!(cli.resolve().unwrap_err().code, 2);
-        let cli = Cli::try_parse_from(["p", "3000", "--api", "not a url"]).unwrap();
-        assert_eq!(cli.resolve().unwrap_err().code, 2);
+        for api in ["http://127.0.0.1:1", "http://127.0.0.1:1/"] {
+            let invocation = parse(&["p", "3000", "-d", "./state", "--api", api]);
+            assert_eq!(invocation.api.as_deref(), Some(api));
+        }
+        for api in ["ftp://host", "not a url"] {
+            let cli = Cli::try_parse_from(["p", "3000", "-d", "./state", "--api", api]).unwrap();
+            let error = cli.resolve().unwrap_err();
+            assert_eq!(error.code, 2);
+            assert!(error.message.contains("invalid --api"), "{error}");
+        }
     }
 
     #[test]
@@ -512,7 +515,7 @@ mod tests {
             "http://127.0.0.1:8080?x=1",
             "http://127.0.0.1:8080#frag",
         ] {
-            let cli = Cli::try_parse_from(["p", "3000", "--api", api]).unwrap();
+            let cli = Cli::try_parse_from(["p", "3000", "-d", "./state", "--api", api]).unwrap();
             let error = cli.resolve().unwrap_err();
             assert_eq!(error.code, 2, "{api} should be rejected");
             assert!(error.message.contains("origin only"), "{}", error.message);

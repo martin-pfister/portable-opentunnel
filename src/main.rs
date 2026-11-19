@@ -6,7 +6,7 @@ use portable_opentunnel::cli::{self, Action, Invocation};
 use portable_opentunnel::error::{self, AppError};
 use portable_opentunnel::forward::{self, Completed, Run};
 use portable_opentunnel::state::Mode;
-use portable_opentunnel::{remove, signals, trust, url};
+use portable_opentunnel::{directory, remove, signals, trust, url};
 
 fn main() {
     // Process-wide handlers first: a signal during provisioning, attachment,
@@ -57,7 +57,8 @@ fn execute(invocation: &Invocation) -> Result<Completed, AppError> {
         // `url` is local and offline: it must not fail because a CA setting
         // for *network* operations is unusable.
         Action::Url => {
-            let found = url::run(invocation.directory.as_deref())?;
+            let path = directory::require_explicit(invocation.directory.as_deref())?;
+            let found = url::run(path)?;
             write_stdout(&found)?;
             Ok(Completed {
                 url: found,
@@ -65,9 +66,10 @@ fn execute(invocation: &Invocation) -> Result<Completed, AppError> {
             })
         }
         Action::Delete => {
+            let path = directory::require_explicit(invocation.directory.as_deref())?;
             let trust = trust::Trust::resolve(invocation.ca_cert.clone())?;
             remove::run(
-                invocation.directory.as_deref(),
+                path,
                 invocation.api.as_deref(),
                 trust.ca_cert.as_deref(),
                 invocation.shutdown_timeout,

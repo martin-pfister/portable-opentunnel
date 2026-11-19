@@ -1,6 +1,6 @@
 //! Choosing and creating the state directory for each mode.
 //!
-//! * Reusable: `--directory` is the exact directory, or `$PWD/.portable-opentunnel`.
+//! * Reusable: `--directory` names the exact directory and is required.
 //!   It is created when missing, privately and exclusively.
 //! * Ephemeral: an explicit `--directory` must not exist at all (not even
 //!   empty) and is created exclusively; otherwise a unique directory under
@@ -13,50 +13,17 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
-use crate::state;
+use crate::state::{self, Mode};
 
-pub const DEFAULT_DIR_NAME: &str = ".portable-opentunnel";
 const EPHEMERAL_PREFIX: &str = "portable-opentunnel-";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Reusable,
-    Ephemeral,
-}
-
-/// The directory an invocation operates on.
-#[derive(Debug)]
-pub struct Chosen {
-    pub path: PathBuf,
-    pub kind: Kind,
-}
-
-/// Resolves the directory without creating anything. Used by `url`, which
-/// must never create a missing directory.
-pub fn resolve_readonly(directory: Option<&Path>, kind: Kind) -> AppResult<PathBuf> {
-    match directory {
-        Some(path) => Ok(absolutize(path)),
-        None => match kind {
-            Kind::Reusable => Ok(default_directory()?),
-            Kind::Ephemeral => Err(AppError::new(
-                2,
-                "an ephemeral run needs a directory to name it: pass --directory or run \
-                 with --ephemeral, which creates a unique temporary directory",
-            )),
-        },
-    }
-}
-
-/// `$PWD/.portable-opentunnel`, falling back to the process working directory
-/// resolved through the OS when `PWD` is absent or not absolute.
-pub fn default_directory() -> AppResult<PathBuf> {
-    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from)
-        && pwd.is_absolute()
-    {
-        return Ok(pwd.join(DEFAULT_DIR_NAME));
-    }
-    let cwd = std::env::current_dir().map_err(AppError::io("resolving the current directory"))?;
-    Ok(cwd.join(DEFAULT_DIR_NAME))
+pub fn require_explicit(directory: Option<&Path>) -> AppResult<&Path> {
+    directory.ok_or_else(|| {
+        AppError::new(
+            2,
+            "--directory DIR is required unless forwarding with --ephemeral",
+        )
+    })
 }
 
 /// Makes a user-supplied path absolute against the current directory, without
@@ -92,35 +59,25 @@ pub fn choose_temporary_parent(tmpdir: Option<OsString>) -> PathBuf {
     }
 }
 
-/// The temporary parent for ephemeral runs, read from the environment.
-pub fn temporary_parent() -> PathBuf {
-    choose_temporary_parent(std::env::var_os("TMPDIR"))
-}
-
 /// Picks and creates the directory for a forwarding or init invocation.
-pub fn prepare(directory: Option<&Path>, kind: Kind) -> AppResult<Chosen> {
-    prepare_with(directory, kind, std::env::var_os("TMPDIR"))
+pub fn prepare(directory: Option<&Path>, mode: Mode) -> AppResult<PathBuf> {
+    prepare_with(directory, mode, std::env::var_os("TMPDIR"))
 }
 
 /// [`prepare`] with the ephemeral parent supplied explicitly, so the decision
 /// is testable without touching process-wide environment state.
 pub fn prepare_with(
     directory: Option<&Path>,
-    kind: Kind,
+    mode: Mode,
     tmpdir: Option<OsString>,
-) -> AppResult<Chosen> {
-    match (kind, directory) {
-        (Kind::Reusable, Some(path)) => {
-            let path = absolutize(path);
+) -> AppResult<PathBuf> {
+    match (mode, directory) {
+        (Mode::Reusable, directory) => {
+            let path = absolutize(require_explicit(directory)?);
             create_reusable(&path)?;
-            Ok(Chosen { path, kind })
+            Ok(path)
         }
-        (Kind::Reusable, None) => {
-            let path = default_directory()?;
-            create_reusable(&path)?;
-            Ok(Chosen { path, kind })
-        }
-        (Kind::Ephemeral, Some(path)) => {
+        (Mode::Ephemeral, Some(path)) => {
             let path = absolutize(path);
             // An explicit ephemeral directory must not exist at all, so a
             // persistent identity can never be turned into a disposable one.
@@ -137,13 +94,9 @@ pub fn prepare_with(
                     AppError::io(format!("creating {}", path.display()))(error)
                 }
             })?;
-            Ok(Chosen { path, kind })
+            Ok(path)
         }
-        (Kind::Ephemeral, None) => {
-            let parent = choose_temporary_parent(tmpdir);
-            let path = create_unique(&parent)?;
-            Ok(Chosen { path, kind })
-        }
+        (Mode::Ephemeral, None) => create_unique(&choose_temporary_parent(tmpdir)),
     }
 }
 
@@ -219,21 +172,28 @@ mod tests {
     fn explicit_reusable_directory_is_created_once() {
         let temp = TempDir::new();
         let path = temp.path().join("state");
-        let chosen = prepare(Some(&path), Kind::Reusable).unwrap();
-        assert_eq!(chosen.path, path);
+        let chosen = prepare(Some(&path), Mode::Reusable).unwrap();
+        assert_eq!(chosen, path);
         assert!(private(&path));
         // A second run accepts the existing private directory.
-        let again = prepare(Some(&path), Kind::Reusable).unwrap();
-        assert_eq!(again.path, path);
+        let again = prepare(Some(&path), Mode::Reusable).unwrap();
+        assert_eq!(again, path);
+    }
+
+    #[test]
+    fn reusable_mode_requires_an_explicit_directory() {
+        let error = prepare(None, Mode::Reusable).unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("--directory"));
     }
 
     #[test]
     fn explicit_ephemeral_directory_must_not_exist() {
         let temp = TempDir::new();
         let path = temp.path().join("run");
-        prepare(Some(&path), Kind::Ephemeral).unwrap();
+        prepare(Some(&path), Mode::Ephemeral).unwrap();
         // Even an empty existing directory is refused.
-        let error = prepare(Some(&path), Kind::Ephemeral).unwrap_err();
+        let error = prepare(Some(&path), Mode::Ephemeral).unwrap_err();
         assert!(error.message.contains("exists"), "{}", error.message);
     }
 
@@ -301,8 +261,8 @@ mod tests {
         fs::create_dir(&real).unwrap();
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(prepare(Some(&link), Kind::Reusable).is_err());
-        assert!(prepare(Some(&link), Kind::Ephemeral).is_err());
+        assert!(prepare(Some(&link), Mode::Reusable).is_err());
+        assert!(prepare(Some(&link), Mode::Ephemeral).is_err());
     }
 
     #[test]
@@ -310,11 +270,11 @@ mod tests {
         let temp = TempDir::new();
         let chosen = prepare_with(
             None,
-            Kind::Ephemeral,
+            Mode::Ephemeral,
             Some(temp.path().as_os_str().to_owned()),
         )
         .unwrap();
-        assert!(chosen.path.starts_with(temp.path()));
-        assert!(private(&chosen.path));
+        assert!(chosen.starts_with(temp.path()));
+        assert!(private(&chosen));
     }
 }

@@ -184,7 +184,6 @@ impl Process {
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &home)
             .env("TMPDIR", &tmp)
-            .env("PWD", &cwd)
             .env("XDG_DATA_HOME", scratch.path("xdg-data"))
             .env("XDG_CONFIG_HOME", scratch.path("xdg-config"))
             .env("XDG_STATE_HOME", scratch.path("xdg-state"))
@@ -833,21 +832,19 @@ fn persistent_forward_serves_traffic_then_keeps_identity_on_sigterm() {
     );
 }
 
-/// An ephemeral run deletes its remote registration and removes its own local
-/// state on exit.
+/// Without an explicit directory, ephemeral forwarding uses TMPDIR and
+/// removes both the registration and its temporary state on exit.
 #[test]
 fn ephemeral_exit_deletes_remotely_and_removes_local_state() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
+    let tmp = scratch.path("tmp");
 
     let mut process = Process::spawn(
         &scratch,
         &[
             backend.target().as_str(),
             "--ephemeral",
-            "--directory",
-            state.to_str().unwrap(),
             "--api",
             &api.api_url(),
             "--startup-timeout",
@@ -861,6 +858,11 @@ fn ephemeral_exit_deletes_remotely_and_removes_local_state() {
     process
         .wait_line("https://", Duration::from_secs(40))
         .expect("the ephemeral tunnel must attach");
+    let mut entries = fs::read_dir(&tmp).unwrap();
+    let state = entries.next().expect("state under TMPDIR").unwrap().path();
+    assert!(state.join("wrapper.json").is_file());
+    assert!(entries.next().is_none(), "one temporary state directory");
+    assert!(fs::read_dir(scratch.path("cwd")).unwrap().next().is_none());
     process.signal(libc::SIGTERM);
     process
         .expect_code(143, Duration::from_secs(25), "ephemeral SIGTERM")

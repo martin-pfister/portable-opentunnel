@@ -6,7 +6,7 @@
 //! after the remote outcome is confirmed or confirmed absent.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::budget::Budget;
@@ -19,16 +19,13 @@ use crate::remote::{self, Outcome};
 use crate::state::{self, Classification, StateLock, WrapperMeta};
 
 pub fn run(
-    directory: Option<&Path>,
+    directory: &Path,
     api_override: Option<&str>,
     ca_cert: Option<&Path>,
     deadline: Duration,
     verbose: u8,
 ) -> AppResult<Completed> {
-    let root: PathBuf = match directory {
-        Some(path) => directory::absolutize(path),
-        None => directory::default_directory()?,
-    };
+    let root = directory::absolutize(directory);
     let mut warnings = Vec::new();
     match std::fs::symlink_metadata(&root) {
         Ok(_) => {}
@@ -253,7 +250,7 @@ mod tests {
         // private and ours, but its contents are not a state layout.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(root.join("notes.txt"), b"keep me").unwrap();
-        let error = run(Some(&root), None, None, Duration::from_millis(10), 0).unwrap_err();
+        let error = run(&root, None, None, Duration::from_millis(10), 0).unwrap_err();
         assert!(error.message.contains("only deletes"), "{}", error.message);
         assert!(root.join("notes.txt").exists());
         assert_eq!(
@@ -269,7 +266,7 @@ mod tests {
         let root = temp.path().join("mine");
         state::create_private_dir(&root).unwrap();
 
-        let error = run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap_err();
+        let error = run(&root, None, None, Duration::from_secs(1), 0).unwrap_err();
 
         assert!(error.message.contains("no recognized state"), "{error}");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
@@ -282,7 +279,7 @@ mod tests {
         fs::write(&file, b"not a directory").unwrap();
         let root = file.join("state");
 
-        let error = run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap_err();
+        let error = run(&root, None, None, Duration::from_secs(1), 0).unwrap_err();
 
         assert_eq!(error.code, crate::error::FAILURE);
         assert!(
@@ -297,7 +294,7 @@ mod tests {
         let root = temp.path().join("state");
         state_with_profile(&root, true);
         fs::write(root.join(layout::WRAPPER_FILE), b"{bad").unwrap();
-        let error = run(Some(&root), None, None, Duration::from_millis(10), 0).unwrap_err();
+        let error = run(&root, None, None, Duration::from_millis(10), 0).unwrap_err();
         assert!(
             error.message.contains("refusing to delete"),
             "{}",
@@ -312,7 +309,7 @@ mod tests {
         let root = temp.path().join("state");
         state_with_profile(&root, true);
         let _held = StateLock::acquire(&root, true).unwrap();
-        let error = run(Some(&root), None, None, Duration::from_millis(10), 0).unwrap_err();
+        let error = run(&root, None, None, Duration::from_millis(10), 0).unwrap_err();
         assert!(
             error.message.contains("holds the lock"),
             "{}",
@@ -326,7 +323,7 @@ mod tests {
         let root = temp.path().join("state");
         state_with_profile(&root, true);
         let error = run(
-            Some(&root),
+            &root,
             Some("http://127.0.0.1:9"),
             None,
             Duration::from_millis(10),
@@ -340,7 +337,7 @@ mod tests {
     fn missing_directory_is_harmless() {
         let temp = TempDir::new();
         let root = temp.path().join("absent");
-        let completed = run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap();
+        let completed = run(&root, None, None, Duration::from_secs(1), 0).unwrap();
         assert!(
             completed
                 .warnings
@@ -359,11 +356,11 @@ mod tests {
         fs::write(root.join(residue), b"{}").unwrap();
         {
             let _failure = cleanup::InjectedUnlinkFailure::arm(residue);
-            let error = run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap_err();
+            let error = run(&root, None, None, Duration::from_secs(1), 0).unwrap_err();
             assert!(error.message.contains(residue), "{error}");
             assert!(root.join(residue).exists());
         }
-        run(Some(&root), None, None, Duration::from_secs(1), 0).unwrap();
+        run(&root, None, None, Duration::from_secs(1), 0).unwrap();
         assert!(!root.exists());
     }
 
@@ -380,7 +377,7 @@ mod tests {
         state::mark_remote_deleted(&root, &meta).unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500)).unwrap();
 
-        let result = run(Some(&root), None, None, Duration::ZERO, 0);
+        let result = run(&root, None, None, Duration::ZERO, 0);
 
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let error = result.unwrap_err();
@@ -404,7 +401,7 @@ mod tests {
         // contacting anything and this would not exercise the remote path.
         state_at(&root, true, "http://127.0.0.1:1");
         let error = run(
-            Some(&root),
+            &root,
             Some("http://127.0.0.1:1"),
             None,
             Duration::from_millis(1),
@@ -432,7 +429,7 @@ mod tests {
         state_at(&root, true, &api);
         fs::write(layout::profile_dir(&root).join(layout::TOKEN), TOKEN).unwrap();
 
-        let error = run(Some(&root), Some(&api), None, Duration::from_secs(5), 0).unwrap_err();
+        let error = run(&root, Some(&api), None, Duration::from_secs(5), 0).unwrap_err();
 
         assert_kept_credentials(&root, &error.message);
         // A fixture (or hostile endpoint) echoing the request must not leak

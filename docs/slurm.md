@@ -27,8 +27,8 @@ trap. Check how your site signals and cleans up jobs.
 - Choose a fresh ephemeral `--directory` on durable storage if you want to
   retry deletion after node failure. The default temporary directory is often
   node-local, and losing it can mean losing the only copy of the token.
-- For a stable URL, use a reusable `--directory` instead of `--ephemeral`.
-  Do not share it between concurrent jobs.
+- For a stable URL, omit `--ephemeral` and supply the required `--directory`.
+  Do not share that directory between concurrent jobs.
 
 The public URL appears on stdout once the bridge attaches; verify application
 readiness separately. See the [operations guide](operations.md) for recovery.

@@ -4,11 +4,8 @@
 
 # ---------------------------------------------------------------- credentials
 # State directories hold the SDK token, private key, certificate, and route.
-# Never commit them. The default directory is covered here; a directory chosen
-# with --directory is up to you, which is deliberate: an unexpectedly
-# untracked `wrapper.json` or `token` file should be *visible* in `git status`
-# for review, not silently ignored by a broad pattern.
-.portable-opentunnel/
+# Never commit state. Keep your chosen --directory outside the checkout or
+# ignore it explicitly; also guard the SDK profile against accidental staging.
 sdk/default/
 
 # ---------------------------------------------------------- build products
