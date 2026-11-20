@@ -192,8 +192,30 @@ mod tests {
         )
         .unwrap();
 
+        // A refused connection would be retried until the deadline, so the
+        // server must answer, with a status the SDK does not retry.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                head.push(byte[0]);
+            }
+            let body = r#"{"tag":"Unauthorized","message":"bad token"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
         let error = delete_saved_identity(Request {
-            api: "http://127.0.0.1:1",
+            api: &api,
             state_root: &root,
             ca_cert: None,
             deadline: Instant::now() + Duration::from_secs(5),
