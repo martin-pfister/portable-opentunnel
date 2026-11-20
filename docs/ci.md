@@ -136,6 +136,8 @@ the archive and checksum. The Actions artifact, including the metadata,
 expires after 30 days; the release assets do not share that retention limit.
 
 Build numbers come from `github.run_number`, so failed and non-release runs
-can leave gaps. The Cargo version stays unchanged. Reruns can finish a draft
-but do not replace a published release. An older build finishing late does not
+can leave gaps. The published binary reports its release tag in `--version`
+(for example, `portable-opentunnel build-42`); local builds report `dev`.
+There is no Cargo package version to maintain. Reruns can finish a draft but
+do not replace a published release. An older build finishing late does not
 replace a newer numbered release as Latest.

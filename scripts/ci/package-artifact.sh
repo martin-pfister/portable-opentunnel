@@ -5,12 +5,11 @@
 # artifact is never published with a hidden dynamic loader.
 #
 # Usage:
-#   package-artifact.sh --binary PATH --target TRIPLE --outdir DIR [--version VERSION]
+#   package-artifact.sh --binary PATH --target TRIPLE --outdir DIR
 #
 # The release target is x86_64-unknown-linux-musl.
-# --version defaults to `cargo metadata`'s package version when Cargo metadata
-# is available, otherwise to "0.0.0-unknown". Commit and build metadata come from
-# the environment when set: GITHUB_SHA (fallback: git rev-parse HEAD) and
+# The build version comes from PORTABLE_OPENTUNNEL_BUILD_ID (default: dev).
+# Other metadata comes from GITHUB_SHA (fallback: git rev-parse HEAD) and
 # GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT (empty outside CI).
 set -euo pipefail
 
@@ -20,14 +19,13 @@ repo_root=$(cd -- "$here/../.." && pwd)
 binary=
 target=
 outdir=
-version=
+version=${PORTABLE_OPENTUNNEL_BUILD_ID:-dev}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --binary) binary=${2:?--binary needs a value}; shift 2 ;;
     --target) target=${2:?--target needs a value}; shift 2 ;;
     --outdir) outdir=${2:?--outdir needs a value}; shift 2 ;;
-    --version) version=${2:?--version needs a value}; shift 2 ;;
     -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "package-artifact: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -41,12 +39,6 @@ done
   exit 2
 }
 [[ -f $binary ]] || { echo "package-artifact: missing binary: $binary" >&2; exit 1; }
-
-if [[ -z $version ]]; then
-  version=$(cd "$repo_root" && cargo metadata --locked --no-deps --format-version 1 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])' 2>/dev/null || true)
-  [[ -n $version ]] || version=0.0.0-unknown
-fi
 
 commit=${GITHUB_SHA:-}
 if [[ -z $commit ]] && command -v git >/dev/null 2>&1 && git -C "$repo_root" rev-parse HEAD >/dev/null 2>&1; then

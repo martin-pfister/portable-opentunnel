@@ -11,10 +11,15 @@ use crate::error::{AppError, AppResult};
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
+const BUILD_ID: &str = match option_env!("PORTABLE_OPENTUNNEL_BUILD_ID") {
+    Some(id) if !id.is_empty() => id,
+    _ => "dev",
+};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "portable-opentunnel",
-    version,
+    version = BUILD_ID,
     about = "Expose one local service through OpenTunnel from a foreground process",
     long_about = "Expose one local service through OpenTunnel.\n\n\
         Works without systemd, root, or an installed OpenTunnel CLI, so it also runs inside Slurm jobs.\n\
@@ -417,5 +422,14 @@ mod tests {
             let error = Cli::try_parse_from(["portable-opentunnel", flag]).unwrap_err();
             assert_eq!(error.exit_code(), 0, "{flag} should exit successfully");
         }
+    }
+
+    #[test]
+    fn version_reports_the_build_id() {
+        let version = Cli::try_parse_from(["p", "--version"]).unwrap_err();
+        assert_eq!(
+            version.to_string(),
+            format!("portable-opentunnel {BUILD_ID}\n")
+        );
     }
 }
