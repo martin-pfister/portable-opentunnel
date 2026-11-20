@@ -52,8 +52,8 @@ pub struct NetworkArgs {
     #[arg(long, value_name = "PEM")]
     pub ca_cert: Option<PathBuf>,
 
-    /// Use another API endpoint (for local testing)
-    #[arg(long, hide = true, value_name = "URL", value_parser = parse_api)]
+    /// API origin of a private OpenTunnel service [default: https://opentunnel.xyz]
+    #[arg(long, value_name = "URL", value_parser = parse_api)]
     pub api: Option<String>,
 
     /// Print more diagnostics (credentials are never printed)
@@ -234,6 +234,8 @@ fn parse_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+/// Accepts an http(s) origin and returns it normalized (lowercase host, no
+/// default port, no trailing slash), so equal origins compare equal.
 fn parse_api(api: &str) -> Result<String, String> {
     let url = url::Url::parse(api).map_err(|error| error.to_string())?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -249,7 +251,7 @@ fn parse_api(api: &str) -> Result<String, String> {
                 .to_owned(),
         );
     }
-    Ok(api.to_owned())
+    Ok(url.origin().ascii_serialization())
 }
 
 #[cfg(test)]
@@ -380,9 +382,14 @@ mod tests {
 
     #[test]
     fn api_override_is_validated() {
-        for api in ["http://127.0.0.1:1", "http://127.0.0.1:1/"] {
+        for (api, origin) in [
+            ("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            ("http://127.0.0.1:1/", "http://127.0.0.1:1"),
+            ("HTTPS://Tunnel.Example:443/", "https://tunnel.example"),
+            ("http://[::1]:8080", "http://[::1]:8080"),
+        ] {
             let forward = parse_ephemeral(&["p", "ephemeral", "3000", "--api", api]);
-            assert_eq!(forward.run.network.api.as_deref(), Some(api));
+            assert_eq!(forward.run.network.api.as_deref(), Some(origin), "{api}");
         }
         for api in ["ftp://host", "not a url"] {
             let error = Cli::try_parse_from(["p", "ephemeral", "3000", "--api", api]).unwrap_err();

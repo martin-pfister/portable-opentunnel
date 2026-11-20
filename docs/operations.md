@@ -93,8 +93,8 @@ Proxies are read from `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and
 
 For a private OpenTunnel service, pass its origin with `--api`, such as
 `--api https://tunnel.internal.example`. The origin is saved in the state
-directory, and later commands refuse a different one. `OPENTUNNEL_API` is not
-read.
+directory, so later commands can omit `--api`; a different origin is refused.
+`OPENTUNNEL_API` is not read.
 
 ## Static binary limitations
 

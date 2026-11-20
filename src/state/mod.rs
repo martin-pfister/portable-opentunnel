@@ -118,12 +118,15 @@ impl WrapperMeta {
     /// Refuses an `--api` override that differs from the recorded endpoint: a
     /// saved identity only exists on the service that created it.
     pub fn check_api(&self, requested: Option<&str>) -> AppResult<()> {
+        let origin = |api: &str| url::Url::parse(api).map(|url| url.origin().ascii_serialization());
         match requested {
-            Some(requested) if requested != self.api => Err(AppError::fail(format!(
-                "the state directory was created for {}, but --api {requested} was given; \
+            Some(requested) if origin(requested) != origin(&self.api) => {
+                Err(AppError::fail(format!(
+                    "the state directory was created for {}, but --api {requested} was given; \
                  omit --api or pass the recorded endpoint",
-                self.api
-            ))),
+                    self.api
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -309,6 +312,16 @@ mod tests {
         meta.check_api(Some(DEFAULT_API)).unwrap();
         let error = meta.check_api(Some("http://127.0.0.1:2")).unwrap_err();
         assert!(error.message.contains("--api"), "{error}");
+    }
+
+    #[test]
+    fn an_endpoint_saved_with_a_trailing_slash_matches_its_origin() {
+        let meta = WrapperMeta::new(
+            Mode::Reusable,
+            "https://Tunnel.Example/".to_owned(),
+            "abc".to_owned(),
+        );
+        meta.check_api(Some("https://tunnel.example")).unwrap();
     }
 
     #[test]
