@@ -86,29 +86,20 @@ Run as a non-root user so permission tests are meaningful. The container has
 without external DNS. This tests AlmaLinux **userland**, not the distribution's
 native kernel. No CI job contacts the hosted OpenTunnel service.
 
-### Release binary exercise
+Integration tests run against the release executable, not a debug build.
+These variables control that:
 
-[`test-manifest.py`](../scripts/ci/test-manifest.py) selects test executables
-from Cargo JSON using `profile.test`, not `target.kind`, so it includes unit
-test harnesses but excludes the plain executable.
+- `PORTABLE_OPENTUNNEL_TEST_BINARY` selects the executable under test. When
+  unset, tests use Cargo's `CARGO_BIN_EXE_portable-opentunnel`.
+- `PORTABLE_OPENTUNNEL_TEST_BINARY_USED` names a file that each test launching
+  that executable appends to. Acceptance fails if it stays empty.
+- `PORTABLE_OPENTUNNEL_TEST_HOST` supplies the controlled hostname; it defaults
+  to `localhost`.
 
-- `PORTABLE_OPENTUNNEL_TEST_BINARY` points integration tests to the release
-  executable. When unset, tests use Cargo's `CARGO_BIN_EXE_portable-opentunnel`.
-- When `PORTABLE_OPENTUNNEL_TEST_BINARY_USED` is set, a test that launches it
-  appends one line to that file. Acceptance fails if the file stays empty.
-  This guards against testing only the development binary; it is not an
-  independent trace of child processes.
-- `PORTABLE_OPENTUNNEL_TEST_HOST` supplies the controlled hostname. For a
-  normal local test run it defaults to `localhost`.
-
-### Filesystem boundary
-
-Acceptance compares before-and-after snapshots of regular files (mode, size,
-mtime, path) and directories (path only). It includes `/tmp` and `/var/tmp`
-but excludes the writable scratch tree, `/proc`, `/sys`, `/dev`, `/run`,
-`/var/log`, and `/var/cache`. The snapshots must contain known system paths and
-a plausible number of entries. They do not catch transient writes or changes
-in unreadable directories; the runner reports such omissions.
+Acceptance also compares filesystem snapshots taken before and after the
+tests, so a test that writes outside its scratch directory, including to
+`/tmp`, fails. The comments in `run-acceptance.sh` list what the snapshots
+cover and what they cannot see.
 
 ## Reproducing the container run locally
 

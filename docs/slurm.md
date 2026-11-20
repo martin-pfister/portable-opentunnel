@@ -17,8 +17,8 @@ python3 ./serve.py --port 3000 &
 exec ./portable-opentunnel ephemeral 3000
 ```
 
-`exec` makes the wrapper the batch process, so a SIGTERM sent to that
-process reaches the wrapper directly. The example relies on Slurm to clean up
+`exec` makes `portable-opentunnel` the batch process, so a SIGTERM sent to
+that process reaches it directly. The example relies on Slurm to clean up
 the background service when the job ends; no shell is left to run an `EXIT`
 trap. Check how your site signals and cleans up jobs.
 
@@ -30,5 +30,5 @@ trap. Check how your site signals and cleans up jobs.
 - For a stable URL, use `up 3000 --dir DIR` instead. Do not share that directory
   between concurrent jobs.
 
-The public URL appears on stdout once the bridge attaches; verify application
-readiness separately. See the [operations guide](operations.md) for recovery.
+The public URL appears on stdout once the tunnel connects; check separately
+that your service is ready. See the [operations guide](operations.md) for recovery.

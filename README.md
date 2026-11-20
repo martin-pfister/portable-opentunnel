@@ -35,13 +35,13 @@ connected, not that your application is healthy. Diagnostics go to stderr.
 **The URL is public.** Only expose services intended to be reachable from the
 internet, and configure application authentication if needed.
 
-`ephemeral` creates a new identity in a private directory under `$TMPDIR`
-(or `/tmp`). Press Ctrl+C to stop forwarding and attempt cleanup.
+`ephemeral` keeps the URL's credentials in a new private directory under
+`$TMPDIR` (or `/tmp`). Press Ctrl+C to stop forwarding and delete the URL.
 
 ## Reuse the same URL
 
-Use `up` with `--dir DIR`. It forwards in the foreground and saves the identity
-and URL in that directory. Run `up` again with the same directory to get the
+Use `up` with `--dir DIR`. It forwards in the foreground and saves the URL and
+its credentials in that directory. Run `up` again with the same directory to get the
 same URL, even if the local port changes.
 
 ```sh
@@ -53,20 +53,19 @@ Give concurrent jobs separate directories.
 `init`, `url`, and `delete` also require `--dir`:
 
 ```sh
-./portable-opentunnel init   --dir ./my-tunnel  # create an identity, without forwarding
+./portable-opentunnel init   --dir ./my-tunnel  # create the URL without forwarding
 ./portable-opentunnel url    --dir ./my-tunnel  # print the saved URL offline
-./portable-opentunnel delete --dir ./my-tunnel  # retire the identity and remove its state
+./portable-opentunnel delete --dir ./my-tunnel  # delete the URL and its local state
 ```
 
-If cleanup fails, keep the state directory and retry `delete` with the path
-shown on stderr. See the [recovery guide](docs/operations.md#state-and-recovery)
-for details.
+If cleanup fails, the credentials are kept and stderr shows the `delete`
+command to retry with. See [recovery](docs/operations.md#recovery) for details.
 
 ## More information
 
 - `./portable-opentunnel --help` for flags and exit codes.
-- [Operations guide](docs/operations.md): timeouts, exit status, state, recovery,
-  TLS, proxies, and static binary limitations.
+- [Operations guide](docs/operations.md): timeouts, exit status, recovery, TLS,
+  proxies, and static binary limitations.
 - [Slurm example](docs/slurm.md): batch script and signal handling.
 - [Build and CI](docs/ci.md): source build, checks, and artifact validation.
 - [SDK upgrade checklist](docs/sdk-upgrades.md) for maintainers.
