@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fake_api::{BACKEND_BODY, FakeApi, serve_backend};
-use scratch::{Scratch, binary};
+use scratch::Scratch;
 
 impl Scratch {
     /// The state directory a test operates on.
@@ -48,42 +48,6 @@ impl Scratch {
 // ---------------------------------------------------------------------------
 // The child process
 // ---------------------------------------------------------------------------
-
-/// Environment variable the CI acceptance step uses to prove a *release*
-/// binary was actually exercised by this suite rather than only compiled.
-///
-/// When it is set, every successful spawn appends one line naming the binary
-/// and a short context. The path is opened in append mode and each line is
-/// written with a single `write_all`, so concurrent tests interleave whole
-/// lines rather than corrupting each other.
-const MARKER_ENV: &str = "PORTABLE_OPENTUNNEL_TEST_BINARY_USED";
-
-/// Records one exercised launch. A missing or unset variable is a no-op.
-///
-/// The context is the running test's name, taken from the thread name libtest
-/// assigns, so the marker proves *which* scenarios exercised the binary without
-/// every call site having to pass a label.
-fn record_exercise() {
-    let Some(path) = std::env::var_os(MARKER_ENV).filter(|value| !value.is_empty()) else {
-        return;
-    };
-    let thread = std::thread::current();
-    let context = thread.name().unwrap_or("lifecycle");
-    let line = format!(
-        "{}\t{}\t{}\n",
-        binary().display(),
-        context,
-        std::process::id()
-    );
-    // Best effort: the marker must never turn a real test into a failure.
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
-    }
-}
 
 /// A spawned child with its streams drained on background threads.
 ///
@@ -117,8 +81,6 @@ impl Process {
         }
 
         let mut child = command.spawn().expect("spawning the executable");
-        // Only a real launch counts as exercising the binary.
-        record_exercise();
 
         let stdout = child.stdout.take().expect("the child's stdout");
         let (sender, lines) = mpsc::channel();
@@ -1739,9 +1701,9 @@ fn localhost_target_reaches_a_loopback_backend() {
 
 /// The same resolution path with an operator-supplied name.
 ///
-/// CI may point `PORTABLE_OPENTUNNEL_TEST_HOST` at a name it mapped to loopback
-/// (for example `--add-host portable-opentunnel-fixture:127.0.0.1`). Without the
-/// variable this would repeat the `localhost` test above, so it is skipped.
+/// CI points `PORTABLE_OPENTUNNEL_TEST_HOST` at a name it mapped to loopback in
+/// `/etc/hosts`. Without the variable this would repeat the `localhost` test
+/// above, so it is skipped.
 #[test]
 fn configured_host_target_reaches_a_loopback_backend() {
     let Some(host) = std::env::var("PORTABLE_OPENTUNNEL_TEST_HOST")

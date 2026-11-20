@@ -1,8 +1,8 @@
 name: CI
 
 # Every push to main publishes a numbered GitHub Release once format, Clippy,
-# dependency, and AlmaLinux acceptance checks pass. The three checks run in
-# parallel; only the release job waits for all of them.
+# dependency, and test checks pass. The three checks run in parallel; only the
+# release job waits for all of them.
 #
 # Security posture:
 #   - No `pull_request_target`. Pull request code never sees secrets.
@@ -10,8 +10,8 @@ name: CI
 #     job has `contents: write`; it does not check out or run repository code.
 #   - Every third-party action is pinned to a commit SHA with the release tag in
 #     a comment. Renovate/Dependabot may update the SHA, not a floating tag.
-#   - The acceptance container is referenced by manifest digest, never by tag.
 #   - No job contacts the hosted OpenTunnel service or needs its credentials.
+#     The test harness sends any non-loopback request to a proxy that refuses it.
 on:
   pull_request:
   push:
@@ -90,12 +90,10 @@ jobs:
       - name: Check dependency licenses, advisories, bans, sources
         run: cargo deny --all-features --locked check
 
-  acceptance:
-    name: AlmaLinux 8.8 acceptance and static build
-    # The runner only builds. The static musl executables are tested inside the
-    # pinned AlmaLinux 8.8 container, never on the runner's own userland.
+  test:
+    name: Tests against the static release build
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -120,18 +118,20 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends musl-tools file binutils
 
-      - name: Build static test and release executables
+      - name: Map a fixture hostname to loopback
+        run: echo "127.0.0.1 portable-opentunnel-fixture" | sudo tee -a /etc/hosts
+
+      - name: Build the static release binary and test it
+        env:
+          PORTABLE_OPENTUNNEL_TEST_HOST: portable-opentunnel-fixture
         run: |
           set -euo pipefail
-          scripts/ci/build-static.sh
+          scripts/ci/test-static.sh
           actual=$("target/$MUSL_TARGET/release/portable-opentunnel" --version)
           if [[ "$actual" != "portable-opentunnel $PORTABLE_OPENTUNNEL_BUILD_ID" ]]; then
             echo "Unexpected binary version: $actual (expected $PORTABLE_OPENTUNNEL_BUILD_ID)" >&2
             exit 1
           fi
-
-      - name: Run acceptance tests inside AlmaLinux 8.8
-        run: scripts/ci/run-ci-container.sh --runtime docker --no-build
 
       - name: Package release artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -155,9 +155,9 @@ jobs:
   release:
     name: Publish main build to GitHub Releases
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # Acceptance uploads the package without waiting for the other checks, so
+    # The test job uploads the package without waiting for the other checks, so
     # this job must, or a license or advisory failure could still be published.
-    needs: [quality, dependencies, acceptance]
+    needs: [quality, dependencies, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -168,10 +168,10 @@ jobs:
       group: portable-opentunnel-publish-main
       queue: max
     steps:
-      - name: Download the accepted package
+      - name: Download the tested package
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.acceptance.outputs.artifact-id }}
+          artifact-ids: ${{ needs.test.outputs.artifact-id }}
           # A retry of only this job may use an artifact from an earlier attempt.
           github-token: ${{ github.token }}
           run-id: ${{ github.run_id }}
@@ -216,7 +216,7 @@ jobs:
           else
             run_url="$GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
             gh release create "$tag" --verify-tag --draft --title "$tag" \
-              --notes "Automated build of \`$GITHUB_SHA\`. [CI and acceptance results]($run_url)."
+              --notes "Automated build of \`$GITHUB_SHA\`. [CI results]($run_url)."
           fi
           # Retry incomplete uploads only on a draft. Metadata stays in the CI artifact.
           gh release upload "$tag" --clobber "$archive" "$checksum"

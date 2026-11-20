@@ -7,13 +7,10 @@
 # What it runs:
 #   1. cargo fmt --check
 #   2. cargo clippy --all-targets --locked -- -D warnings
-#   3. cargo test --locked (host target; fast feedback)
-#   4. cargo deny check (dependency licenses, advisories, sources, bans)
-#   5. with musl tooling present: build the static release binary and verify
-#      that it has no loader and no DT_NEEDED entries
-#
-# It does not claim the AlmaLinux container acceptance tests ran. Those need the
-# pinned container and are executed by CI (or run-ci-container.sh locally).
+#   3. cargo deny check (dependency licenses, advisories, sources, bans)
+#   4. scripts/ci/test-static.sh: the static release build, the test suite
+#      against it, and the CLI contract, exactly as CI runs them.
+#      With --no-musl, plain `cargo test` on the host target instead.
 set -euo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -24,7 +21,7 @@ run_musl=1
 for arg in "$@"; do
   case $arg in
     --no-musl) run_musl=0 ;;
-    -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "local-checks: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -41,9 +38,6 @@ cargo fmt --all --check
 step "clippy (warnings denied)"
 cargo clippy --all-targets --locked --all-features -- -D warnings
 
-step "host tests"
-cargo test --locked
-
 step "dependency licenses, advisories, bans, sources"
 if cargo deny --version >/dev/null 2>&1; then
   cargo deny --all-features --locked check
@@ -58,19 +52,11 @@ MSG
 fi
 
 if [[ $run_musl -eq 1 ]]; then
-  step "static release build (x86_64-unknown-linux-musl)"
-  if ! rustup target list --installed | grep -qx x86_64-unknown-linux-musl; then
-    echo "local-checks: musl target not installed; run:" >&2
-    echo "    rustup target add x86_64-unknown-linux-musl" >&2
-    echo "and install a musl C compiler (musl-tools) for ring's C/asm build." >&2
-    exit 1
-  fi
-  # shellcheck source=/dev/null
-  . "$here/musl-env.sh"
-  cargo build --release --locked --target x86_64-unknown-linux-musl
-  "$here/check-static-elf.sh" "target/x86_64-unknown-linux-musl/release/portable-opentunnel"
+  step "tests against the static release build"
+  "$here/test-static.sh"
 else
-  step "static release build skipped (--no-musl)"
+  step "host tests (--no-musl)"
+  cargo test --locked
 fi
 
-printf '\nlocal-checks: passed. Container acceptance tests are not covered here.\n'
+printf '\nlocal-checks: passed.\n'

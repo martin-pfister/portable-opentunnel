@@ -1,9 +1,10 @@
 //! Black-box, offline CLI tests for `portable-opentunnel`.
 //!
 //! Each test spawns the real executable as a child process with a sanitized
-//! environment (cleared proxies, CA variables, and XDG homes) and a private
-//! scratch directory, then asserts on exit status and the bytes on each
-//! stream. Only paths that cannot reach the network are exercised:
+//! environment (cleared CA variables, private XDG homes, and a proxy that
+//! blocks non-loopback hosts) and a private scratch directory, then asserts
+//! on exit status and the bytes on each stream. Only paths that cannot reach
+//! the network are exercised:
 //!
 //! * argument validation (exit 2) and `--help` / `--version` (exit 0),
 //! * the read-only `url` command over hand-built state directories,
@@ -764,4 +765,48 @@ fn forward_refuses_an_unrelated_nonempty_directory() {
         "unrelated content must be preserved"
     );
     assert!(!state.join("wrapper.json").exists());
+}
+
+// ---------------------------------------------------------------------------
+// The harness's network guard
+// ---------------------------------------------------------------------------
+
+/// Without `--api` the binary targets the hosted service. The harness must
+/// route that through its proxy, which never forwards anything; here the
+/// proxy is a listener that only records the first request line.
+#[test]
+fn the_hosted_service_is_only_reachable_through_the_guard_proxy() {
+    use std::io::{BufRead as _, BufReader};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("binding the proxy");
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let mut line = String::new();
+            let _ = BufReader::new(stream).read_line(&mut line);
+            let _ = sender.send(line);
+        }
+    });
+
+    let scratch = Scratch::new();
+    let mut child = scratch
+        .command(&["ephemeral", "3000", "--startup-timeout", "20"])
+        .env("ALL_PROXY", &proxy)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning the executable");
+    let line = received.recv_timeout(Duration::from_secs(15));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let line = line.expect("the default API must be requested through the proxy");
+    assert!(
+        line.starts_with("CONNECT opentunnel.xyz:443 "),
+        "unexpected proxy request: {line:?}"
+    );
 }

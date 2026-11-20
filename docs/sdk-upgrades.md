@@ -58,8 +58,8 @@ not a guarantee for newer releases.
    route and target validation, and CA/proxy behavior. Check resolved features
    (especially Tokio and TLS) and any new dependency in the write path.
 4. **Run the gates.** Update the pin and lockfile together. Run
-   `scripts/ci/local-checks.sh` and the [AlmaLinux acceptance
-   gate](ci.md#reproducing-the-container-run-locally), or verify it in CI.
+   `scripts/ci/local-checks.sh`, which runs the same
+   [tests as CI](ci.md#how-the-tests-run).
    Pay particular attention to the delayed refresh, interrupted create,
    pending-only delete, unrelated-file preservation, and TLS fixture cases in
    [`tests/lifecycle.rs`](../tests/lifecycle.rs).
