@@ -1,25 +1,9 @@
-# Pinned acceptance-test container.
+# Pinned acceptance-test container: AlmaLinux 8.8, x86-64.
 #
-# Source: Docker Hub registry API for `library/almalinux`, tag `8.8`, queried
-# 2026-11-19 at https://hub.docker.com/v2/repositories/library/almalinux/tags/8.8
-# and https://hub.docker.com/v2/repositories/library/almalinux/tags?name=8.8
+# The `8.8` tag on Docker Hub is a multi-arch list (sha256:af06ad21...a6a); its
+# amd64 entry is the image below, the same as `8.8-20230718`. Queried
+# 2026-11-19 from https://hub.docker.com/v2/repositories/library/almalinux/tags/8.8
 #
-# The `8.8` tag is a multi-arch manifest list. Its amd64 entry is the same image
-# as `8.8-20230718` (last rebuild of the 8.8 series, pushed 2023-07-18). We run
-# x86-64 only, so CI references the platform manifest digest directly:
-#
-#   docker.io/library/almalinux@sha256:59fcdf8090ccdf3f69eae066bb40f71bbf38d724c025abad268d520568a487b9
-#
-# The list digest is recorded for provenance. Do not replace either digest with
-# a tag: `8`, `8.8` and `latest` are all mutable names.
-image=almalinux
-registry=docker.io
-repository=library/almalinux
-tag=8.8
-list_digest=sha256:af06ad211fd7a53745bcd0d955dc3fa4d47a42caaf985f761327bdb759248a6a
-amd64_digest=sha256:59fcdf8090ccdf3f69eae066bb40f71bbf38d724c025abad268d520568a487b9
-amd64_compressed_bytes=71544896
-expected_id=almalinux
-expected_version_id=8.8
-expected_platform_id=platform:el8
-queried_at=2026-11-19
+# Pulling by this platform digest fixes both the content and the architecture.
+# Do not replace it with a tag: `8`, `8.8` and `latest` are mutable.
+image=docker.io/library/almalinux@sha256:59fcdf8090ccdf3f69eae066bb40f71bbf38d724c025abad268d520568a487b9

@@ -129,4 +129,17 @@ mod tests {
             assert!(error.message.contains("not a regular file"), "{error}");
         }
     }
+
+    /// Site CAs (a TLS-inspecting proxy, say) reach the SDK only through the OS
+    /// store, which lives in a different place on each distribution. The SDK
+    /// skips an unreadable store silently, so prove the static build finds it.
+    #[test]
+    fn the_os_trust_store_is_found() {
+        let store = rustls_native_certs::load_native_certs();
+        assert!(store.errors.is_empty(), "{:?}", store.errors);
+        assert!(
+            !store.certs.is_empty(),
+            "no OS CA certificates found; install the ca-certificates package"
+        );
+    }
 }

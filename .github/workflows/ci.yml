@@ -1,7 +1,8 @@
 name: CI
 
 # Every push to main publishes a numbered GitHub Release once format, Clippy,
-# dependency, and AlmaLinux acceptance checks pass.
+# dependency, and AlmaLinux acceptance checks pass. The three checks run in
+# parallel; only the release job waits for all of them.
 #
 # Security posture:
 #   - No `pull_request_target`. Pull request code never sees secrets.
@@ -27,8 +28,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Must match `channel` in rust-toolchain.toml; a step below enforces that.
-  RUST_TOOLCHAIN: "1.89.0"
   MUSL_TARGET: x86_64-unknown-linux-musl
   # Share one ID between the binary, package metadata, and published tag.
   PORTABLE_OPENTUNNEL_BUILD_ID: >-
@@ -49,23 +48,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt, clippy
-          targets: ${{ env.MUSL_TARGET }}
-
-      - name: Verify toolchain pin matches rust-toolchain.toml
-        run: |
-          set -euo pipefail
-          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml | tr -d '\r')
-          if [ "$channel" != "$RUST_TOOLCHAIN" ]; then
-            echo "rust-toolchain.toml pins '$channel' but CI pins '$RUST_TOOLCHAIN'" >&2
-            exit 1
-          fi
-          rustc --version
-          cargo --version
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install && rustc --version && cargo --version
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -95,10 +79,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install && cargo --version
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
@@ -110,15 +92,10 @@ jobs:
 
   acceptance:
     name: AlmaLinux 8.8 acceptance and static build
-    # GitHub's runner only orchestrates: it compiles static musl executables,
-    # then executes them inside the pinned AlmaLinux 8.8 container. The runner's
-    # own userland is never an acceptance target.
+    # The runner only builds. The static musl executables are tested inside the
+    # pinned AlmaLinux 8.8 container, never on the runner's own userland.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # Both gates must pass before this job runs. Acceptance is the only job that
-    # can upload a release artifact, so depending on `dependencies` as well as
-    # `quality` keeps a license/advisory failure from ever producing one.
-    needs: [quality, dependencies]
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -127,12 +104,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt, clippy
-          targets: ${{ env.MUSL_TARGET }}
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install && rustc --version && cargo --version
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -147,92 +120,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends musl-tools file binutils
 
-      - name: Select the musl linker
-        # Makes the linker choice explicit instead of relying on `cc`. The
-        # helper writes the variables to $GITHUB_ENV so later steps inherit them.
+      - name: Build static test and release executables
         run: |
           set -euo pipefail
-          . scripts/ci/musl-env.sh
-          grep -E '^(CARGO_TARGET_|CC_)' "$GITHUB_ENV" || true
-
-      - name: Build static test executables
-        run: |
-          set -euo pipefail
-          mkdir -p .ci-out
-          cargo test --locked --no-run --target "$MUSL_TARGET" \
-            --message-format=json > .ci-out/test-messages.json
-          python3 scripts/ci/test-manifest.py \
-            --require-target "$MUSL_TARGET" \
-            .ci-out/test-messages.json > .ci-out/manifest.tsv
-          cat .ci-out/manifest.tsv
-
-      - name: Build static release executable
-        run: |
-          set -euo pipefail
-          cargo build --locked --release --target "$MUSL_TARGET"
-          binary="target/$MUSL_TARGET/release/portable-opentunnel"
-          ls -l "$binary"
-          actual=$("$binary" --version)
+          scripts/ci/build-static.sh
+          actual=$("target/$MUSL_TARGET/release/portable-opentunnel" --version)
           if [[ "$actual" != "portable-opentunnel $PORTABLE_OPENTUNNEL_BUILD_ID" ]]; then
             echo "Unexpected binary version: $actual (expected $PORTABLE_OPENTUNNEL_BUILD_ID)" >&2
             exit 1
           fi
 
-      - name: Verify every test executable and the release binary are static
-        run: |
-          set -euo pipefail
-          mapfile -t test_bins < <(cut -f2 .ci-out/manifest.tsv)
-          scripts/ci/check-static-elf.sh \
-            "target/$MUSL_TARGET/release/portable-opentunnel" \
-            "${test_bins[@]}"
-
-      - name: Pull the pinned AlmaLinux 8.8 image
-        run: |
-          set -euo pipefail
-          image=$(scripts/ci/container-ref.sh)
-          echo "pinned image: $image"
-          docker pull "$image"
-          # Fail if the digest was replaced or the platform is not x86-64. A tag
-          # would hide both problems.
-          scripts/ci/verify-image.sh --runtime docker "$image"
-
       - name: Run acceptance tests inside AlmaLinux 8.8
-        # The workspace is mounted at its own absolute path so paths baked into
-        # test binaries resolve inside the container. The repository is
-        # read-only; the scratch tree is the only writable host mount.
-        #
-        # Runs as the host caller's uid/gid, not root. Docker's default root
-        # bypasses filesystem permission checks (DAC), so a test that expects
-        # `EACCES` cannot exercise that failure path as root or prove how the
-        # program behaves for an ordinary user. The image needs no matching user
-        # entry because the runner sets HOME and the XDG variables explicitly.
-        #
-        # `--add-host` supplies the controlled /etc/hosts name the host-target
-        # test uses, so no external DNS is involved.
-        #
-        # `--require-release-exercised` fails the job unless an integration test
-        # actually launched the shipped binary, so "help and version run" cannot
-        # be mistaken for lifecycle coverage.
-        run: |
-          set -euo pipefail
-          image=$(scripts/ci/container-ref.sh)
-          scratch="$RUNNER_TEMP/acceptance-scratch"
-          rm -rf "$scratch"
-          mkdir -p "$scratch"
-          docker run --rm \
-            --network none \
-            --user "$(id -u):$(id -g)" \
-            --add-host portable-opentunnel-fixture:127.0.0.1 \
-            -e PORTABLE_OPENTUNNEL_TEST_HOST=portable-opentunnel-fixture \
-            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" \
-            -v "$scratch:/scratch:rw" \
-            -w "$GITHUB_WORKSPACE" \
-            "$image" \
-            bash "$GITHUB_WORKSPACE/scripts/ci/run-acceptance.sh" \
-              --manifest "$GITHUB_WORKSPACE/.ci-out/manifest.tsv" \
-              --binary "$GITHUB_WORKSPACE/target/$MUSL_TARGET/release/portable-opentunnel" \
-              --scratch /scratch \
-              --require-release-exercised
+        run: scripts/ci/run-ci-container.sh --runtime docker --no-build
 
       - name: Package release artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -256,7 +155,9 @@ jobs:
   release:
     name: Publish main build to GitHub Releases
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: acceptance
+    # Acceptance uploads the package without waiting for the other checks, so
+    # this job must, or a license or advisory failure could still be published.
+    needs: [quality, dependencies, acceptance]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

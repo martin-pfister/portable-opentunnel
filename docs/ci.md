@@ -59,32 +59,43 @@ Follow the [SDK upgrade checklist](sdk-upgrades.md) before changing the SDK pin.
 ## What CI checks
 
 [CI](../.github/workflows/ci.yml) runs on pull requests, pushes to `main`,
-and manual dispatches. Its jobs:
+and manual dispatches. Its first three jobs run in parallel:
 
-1. **Quality:** formatting, Clippy with warnings denied, the committed lockfile,
-   and agreement between the Rust pins in the workflow and toolchain file.
+1. **Quality:** formatting, Clippy with warnings denied, and the committed
+   lockfile.
 2. **Dependencies:** the `cargo-deny` gate.
-3. **Acceptance:** after the first two jobs pass, build static musl test
-   executables and the release binary, verify their linkage, and run acceptance
-   in the pinned AlmaLinux 8.8 x86-64 container.
-4. **Release:** on pushes to `main` only, publish the exact accepted package.
+3. **Acceptance:** build static musl test executables and the release binary,
+   verify their linkage, and run them in the pinned AlmaLinux 8.8 x86-64
+   container.
+4. **Release:** on pushes to `main` only, once all three pass, publish the
+   exact accepted package.
 
-Actions are pinned to commit SHAs. Build and test jobs inherit `contents: read`;
-only publishing gets `contents: write`. It uses the built-in token and does not
-check out or execute repository code. There is no `pull_request_target` trigger.
+Every job installs the toolchain named in `rust-toolchain.toml`, the only
+place the Rust version is pinned. Actions are pinned to commit SHAs. Build and
+test jobs inherit `contents: read`; only publishing gets `contents: write`. It
+uses the built-in token and does not check out or execute repository code.
+There is no `pull_request_target` trigger.
 
 ### AlmaLinux acceptance
 
-[`container.lock`](../scripts/ci/container.lock) records the image provenance
-and amd64 manifest digest. Keep it pinned to the platform digest, not a
-mutable tag. [`run-acceptance.sh`](../scripts/ci/run-acceptance.sh) verifies the
-OS release and loopback, runs tests with fresh `HOME`, `TMPDIR` and XDG
-directories, and checks the release binary's CLI exit codes and streams.
+The binary is static, so the distribution matters little: it reads
+`/etc/hosts`, the DNS configuration, and the OS CA store, whose location
+differs between distributions. AlmaLinux stands in for the RHEL-family systems
+it mostly runs on. The container shares the runner's kernel.
 
-Run as a non-root user so permission tests are meaningful. The container has
-`--network none`; a controlled `/etc/hosts` name covers hostname resolution
-without external DNS. This tests AlmaLinux **userland**, not the distribution's
-native kernel. No CI job contacts the hosted OpenTunnel service.
+[`container.lock`](../scripts/ci/container.lock) pins the image by its amd64
+manifest digest, never a mutable tag.
+[`run-ci-container.sh`](../scripts/ci/run-ci-container.sh) runs it:
+
+- as a non-root user, so permission tests are meaningful;
+- with `--network none` and a controlled `/etc/hosts` name, so no test reaches
+  the internet or external DNS, and no CI job contacts the hosted service;
+- with a read-only root and checkout, so a write anywhere but the scratch
+  directory, including `/tmp`, fails the test that made it.
+
+[`run-acceptance.sh`](../scripts/ci/run-acceptance.sh) gives each test
+executable fresh `HOME`, `TMPDIR` and XDG directories, then checks the release
+binary's CLI exit codes and streams.
 
 Integration tests run against the release executable, not a debug build.
 These variables control that:
@@ -96,22 +107,18 @@ These variables control that:
 - `PORTABLE_OPENTUNNEL_TEST_HOST` supplies the controlled hostname; it defaults
   to `localhost`.
 
-Acceptance also compares filesystem snapshots taken before and after the
-tests, so a test that writes outside its scratch directory, including to
-`/tmp`, fails. The comments in `run-acceptance.sh` list what the snapshots
-cover and what they cannot see.
-
 ## Reproducing the container run locally
 
-With Docker, Podman, or nerdctl available, run:
+With Docker, Podman, or nerdctl, plus musl-tools and `jq`, run:
 
 ```sh
 scripts/ci/run-ci-container.sh
 ```
 
-Use `--runtime podman` (or `docker` or `nerdctl`) to select the runtime.
-The script builds the binaries, mounts the checkout read-only with a separate
-writable scratch directory, and runs acceptance inside the pinned image.
+Use `--runtime podman` (or `docker` or `nerdctl`) to select the runtime. The
+script builds the binaries with
+[`build-static.sh`](../scripts/ci/build-static.sh) and runs acceptance inside
+the pinned image exactly as CI does.
 
 ## Automatic releases on `main`
 
