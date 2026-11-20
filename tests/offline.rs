@@ -18,93 +18,26 @@
 //!
 //! The fixtures are written from the documented on-disk layout rather than by
 //! calling into `src/`, so these tests stay independent of internal refactors.
-//! The same layout is asserted separately by the unit tests in `src/state.rs`
-//! and `src/layout.rs`; keeping both means a layout change fails loudly in
-//! either place instead of silently desynchronising.
+//! The same layout is asserted separately by the unit tests in `src/state/`;
+//! keeping both means a layout change fails loudly in either place instead of
+//! silently desynchronising.
 
-use std::env;
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use scratch::{Scratch, binary};
 
 // ---------------------------------------------------------------------------
 // Running the executable
 // ---------------------------------------------------------------------------
 
-/// Environment variable naming an already-built executable, for testing a
-/// release binary or one built for another target. Falls back to the binary
-/// Cargo built for this test run.
-fn binary() -> PathBuf {
-    match env::var_os("PORTABLE_OPENTUNNEL_TEST_BINARY") {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => PathBuf::from(env!("CARGO_BIN_EXE_portable-opentunnel")),
-    }
-}
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A unique private directory holding everything one test needs: the state
-/// directories it builds, plus a sanitized `HOME`, `TMPDIR`, and working
-/// directory for the child process.
-struct Scratch {
-    root: PathBuf,
-}
-
 impl Scratch {
-    fn new() -> Self {
-        let base = env::var_os("TMPDIR")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp/opencode"));
-        fs::create_dir_all(&base)
-            .unwrap_or_else(|error| panic!("creating {}: {error}", base.display()));
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default();
-        let root = base.join(format!(
-            "portable-opentunnel-cli-{}-{}-{nonce}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder
-            .create(&root)
-            .unwrap_or_else(|error| panic!("creating {}: {error}", root.display()));
-
-        let scratch = Self { root };
-        for directory in [scratch.home(), scratch.tmp(), scratch.cwd()] {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&directory)
-                .unwrap_or_else(|error| panic!("creating {}: {error}", directory.display()));
-        }
-        scratch
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.root.join(name)
-    }
-
-    fn home(&self) -> PathBuf {
-        self.path("home")
-    }
-
-    fn tmp(&self) -> PathBuf {
-        self.path("tmp")
-    }
-
-    /// The child's working directory, also used for relative path arguments.
-    fn cwd(&self) -> PathBuf {
-        self.path("cwd")
-    }
-
     /// Runs the executable with a cleared, reproducible environment.
     ///
     /// `env_clear` also means no `*_PROXY`, `OPENTUNNEL_CA_CERT`,
@@ -137,13 +70,6 @@ impl Scratch {
             let mut entries = fs::read_dir(&dir).expect("reading the scratch directory");
             assert!(entries.next().is_none(), "{} is not empty", dir.display());
         }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        // Only this test's own unique directory is removed.
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

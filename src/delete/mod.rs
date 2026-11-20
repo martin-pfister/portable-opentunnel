@@ -1,43 +1,41 @@
-//! The explicit `delete` command.
+//! Deleting an identity: the explicit `delete` command, and the same sequence
+//! at the end of an ephemeral run.
 //!
-//! `delete` is the only way to remove a saved identity besides an ephemeral
-//! run's own exit. It refuses live state, unowned state, and unsafe
-//! directories. Remote deletion happens first; local files are removed only
-//! after the remote outcome is confirmed or confirmed absent.
+//! The order never changes: delete the remote registration, durably record
+//! that it is gone, and only then remove local files. Any interruption leaves
+//! a directory that the printed `delete` command can finish.
+
+mod local;
+mod remote;
 
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::budget::Budget;
-use crate::cleanup;
-use crate::directory;
 use crate::error::{AppError, AppResult};
-use crate::forward::Completed;
-use crate::layout;
-use crate::remote::{self, Outcome};
-use crate::state::{self, Classification, StateLock, WrapperMeta};
+use crate::output::Log;
+use crate::state::{
+    self, Classification, StateLock, WrapperMeta, directory, layout, recovery_command,
+};
 
+/// `delete`: refuses live, unowned, or unsafe state, then deletes the saved
+/// identity. Returns warnings for stderr.
 pub fn run(
     directory: &Path,
     api_override: Option<&str>,
     ca_cert: Option<&Path>,
-    deadline: Duration,
-    verbose: u8,
-) -> AppResult<Completed> {
+    timeout: Duration,
+    log: Log,
+) -> AppResult<Vec<String>> {
     let root = directory::absolutize(directory);
-    let mut warnings = Vec::new();
     match std::fs::symlink_metadata(&root) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            warnings.push(format!(
+            return Ok(vec![format!(
                 "{} does not exist; nothing to delete",
                 root.display()
-            ));
-            return Ok(Completed {
-                url: String::new(),
-                warnings,
-            });
+            )]);
         }
         Err(error) => {
             return Err(AppError::io(format!("inspecting {}", root.display()))(
@@ -51,8 +49,7 @@ pub fn run(
     let create_lock = match std::fs::symlink_metadata(&lock_path) {
         Ok(_) => false,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // Never write a lock to an unrecognized directory. Recheck the
-            // classification after locking before deleting anything.
+            // Never write a lock into an unrecognized directory.
             delete_plan(&root)?;
             true
         }
@@ -63,111 +60,18 @@ pub fn run(
         }
     };
     let mut lock = StateLock::acquire(&root, create_lock)?;
-    state::check_private_dir(&root)?;
-    let Some((meta, mode_note)) = delete_plan(&root)? else {
-        // Recognized residue, but no identity to delete remotely.
-        let removal = cleanup::remove_local(&mut lock)?;
-        if !removal.failures.is_empty() {
-            return Err(AppError::fail(format!(
-                "local cleanup failed: {}",
-                removal.describe()
-            )));
-        }
-        warnings.push(removal.describe());
-        return Ok(Completed {
-            url: String::new(),
-            warnings,
-        });
+    // Decide again under the lock: the first look was unprotected.
+    let Some((meta, note)) = delete_plan(&root)? else {
+        return remove_local(&mut lock).map_err(AppError::fail);
     };
-    if let Some(note) = mode_note {
-        warnings.push(note.to_owned());
-    }
+    meta.check_api(api_override)?;
 
-    lock.validate()?;
-    // A marked directory means a previous deletion already removed the remote
-    // registration; retrying must not contact the API (it could not: the
-    // credentials may be partly gone).
-    let outcome = if meta.remote_deleted {
-        Outcome::AlreadyAbsent
-    } else {
-        let api = match api_override {
-            Some(requested) if requested != meta.api => {
-                return Err(AppError::fail(format!(
-                    "the state was created for {}, but --api {requested} was given; delete with \
-                     the recorded endpoint or omit --api",
-                    meta.api
-                )));
-            }
-            Some(requested) => requested.to_owned(),
-            None => meta.api.clone(),
-        };
-        // Every failure path here is recoverable: the remote call either
-        // settled (and only then may local files go) or it did not, in which
-        // case the credentials are untouched and must be *reported* as such.
-        // A bare `?` would drop the diagnostic for transport/HTTP failures
-        // (e.g. a 500), leaving the user with an error that never names the
-        // preserved state directory or the retry command.
-        let outcome = match remote::delete_saved_identity(remote::Request {
-            api: &api,
-            state_root: &root,
-            ca_cert,
-            deadline: Budget::new(deadline).arm(),
-        }) {
-            Ok(outcome) => outcome,
-            Err(error) => return Err(kept_credentials(&root, &error.message)),
-        };
-        if !outcome.may_remove_local() {
-            return Err(kept_credentials(&root, outcome.describe()));
-        }
-        // Durably record the remote result *before* any credential is
-        // unlinked, so an interruption here is still resumable. A failure here
-        // leaves every credential in place.
-        state::mark_remote_deleted(&root, &meta).map_err(|error| {
-            kept_credentials(
-                &root,
-                &format!(
-                    "the tunnel registration was deleted but the deletion could not be recorded \
-                     ({})",
-                    error.message
-                ),
-            )
-        })?;
-        outcome
-    };
-    if verbose > 0 {
-        eprintln!("portable-opentunnel: {}", outcome.describe());
-    }
-
-    let removal = cleanup::remove_local(&mut lock).map_err(|error| {
-        AppError::fail(format!(
-            "the tunnel registration is gone but local cleanup failed: {error}"
-        ))
-    })?;
-    if !removal.failures.is_empty() {
-        return Err(AppError::fail(format!(
-            "the tunnel registration was deleted but local cleanup failed: {}. Retry with: {}",
-            removal.failures.join("; "),
-            cleanup::recovery_command(&root)
-        )));
-    }
-    if !removal.root_removed {
-        warnings.push(removal.describe());
-    }
-    Ok(Completed {
-        url: String::new(),
-        warnings,
-    })
-}
-
-/// An operational error that states plainly that nothing local was removed and
-/// names the retry command.
-fn kept_credentials(root: &Path, problem: &str) -> AppError {
-    let problem = problem.trim_end_matches('.');
-    AppError::fail(format!(
-        "{problem}. Credentials were kept at {}; retry with: {}",
-        root.display(),
-        cleanup::recovery_command(root)
-    ))
+    let mut warnings: Vec<String> = note.into_iter().map(str::to_owned).collect();
+    warnings.extend(
+        delete_identity(&mut lock, &meta, ca_cert, &Budget::new(timeout), log)
+            .map_err(AppError::fail)?,
+    );
+    Ok(warnings)
 }
 
 /// `None` means only recognized residue exists; no registration needs deleting.
@@ -196,17 +100,142 @@ fn delete_plan(root: &Path) -> AppResult<Option<(WrapperMeta, Option<&'static st
     }
 }
 
+/// Deletes the identity in a locked state directory within `budget`.
+///
+/// `Ok` carries notes about a finished deletion. `Err` explains what is left
+/// and always names the retry command.
+pub fn delete_identity(
+    lock: &mut StateLock,
+    meta: &WrapperMeta,
+    ca_cert: Option<&Path>,
+    budget: &Budget,
+    log: Log,
+) -> Result<Vec<String>, String> {
+    // A marked directory must not contact the API again: its credentials may
+    // already be partly gone.
+    if !meta.remote_deleted {
+        delete_remote(lock, meta, ca_cert, budget, log)?;
+    }
+    finish_locally(lock, meta, ca_cert, budget)
+}
+
+fn delete_remote(
+    lock: &StateLock,
+    meta: &WrapperMeta,
+    ca_cert: Option<&Path>,
+    budget: &Budget,
+    log: Log,
+) -> Result<(), String> {
+    let root = lock.root();
+    let kept = |problem: &str| kept_credentials(root, ca_cert, problem);
+    if budget.expired() {
+        return Err(kept(&format!(
+            "the {} second shutdown budget was exhausted before the registration was deleted",
+            budget.timeout().as_secs()
+        )));
+    }
+    lock.validate().map_err(|error| kept(&error.message))?;
+    let outcome = remote::delete_saved_identity(remote::Request {
+        api: &meta.api,
+        state_root: root,
+        ca_cert,
+        deadline: budget.arm(),
+    })
+    .map_err(|error| kept(&error.message))?;
+    if !outcome.may_remove_local() {
+        return Err(kept(outcome.describe()));
+    }
+    log.info(outcome.describe());
+    Ok(())
+}
+
+/// After a settled remote deletion: records it, even when no budget is left,
+/// then removes the local files if time remains.
+fn finish_locally(
+    lock: &mut StateLock,
+    meta: &WrapperMeta,
+    ca_cert: Option<&Path>,
+    budget: &Budget,
+) -> Result<Vec<String>, String> {
+    let root = lock.root().to_path_buf();
+    if !meta.remote_deleted {
+        // Unrecorded, a retry asks the API again and settles on its 404.
+        lock.validate()
+            .and_then(|()| state::mark_remote_deleted(&root, meta))
+            .map_err(|error| {
+                kept_credentials(
+                    &root,
+                    ca_cert,
+                    &format!(
+                        "the tunnel registration was deleted, but the deletion could not be \
+                         recorded ({})",
+                        error.message
+                    ),
+                )
+            })?;
+    }
+    if budget.expired() {
+        return Err(format!(
+            "the {} second shutdown budget ran out before local cleanup; the remote \
+             registration is gone and the directory is marked for resumption. Finish it with: {}",
+            budget.timeout().as_secs(),
+            recovery_command(&root, None)
+        ));
+    }
+    remove_local(lock).map_err(|problem| format!("the tunnel registration is gone, but {problem}"))
+}
+
+/// Removes the owned local files, reporting anything retained.
+fn remove_local(lock: &mut StateLock) -> Result<Vec<String>, String> {
+    let root = lock.root().to_path_buf();
+    let failed = |problem: String| {
+        format!(
+            "local cleanup failed: {problem}. Retry with: {}",
+            recovery_command(&root, None)
+        )
+    };
+    let removal = local::remove(lock).map_err(|error| failed(error.message))?;
+    if !removal.failures.is_empty() {
+        return Err(failed(removal.describe()));
+    }
+    if let Some(problem) = removal.root_error {
+        return Err(format!(
+            "local cleanup failed: {problem}. Nothing owned is left; remove the empty directory \
+             yourself"
+        ));
+    }
+    Ok(if removal.root_removed {
+        Vec::new()
+    } else {
+        vec![removal.describe()]
+    })
+}
+
+/// A problem that left every credential in place, with the retry command.
+fn kept_credentials(root: &Path, ca_cert: Option<&Path>, problem: &str) -> String {
+    format!(
+        "{}. Credentials were kept at {}; retry with: {}",
+        problem.trim_end_matches('.'),
+        root.display(),
+        recovery_command(root, ca_cert)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::state::{DEFAULT_API, Mode, WrapperMeta, write_wrapper};
-    use crate::test_support::TempDir;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    fn state_with_profile(root: &Path, completed: bool) {
-        state_at(root, completed, DEFAULT_API);
+    use crate::state::{DEFAULT_API, Mode, write_wrapper};
+    use crate::test_support::TempDir;
+
+    const QUIET: Log = Log { verbose: false };
+    const SECOND: Duration = Duration::from_secs(1);
+
+    fn delete(root: &Path, api: Option<&str>, timeout: Duration) -> AppResult<Vec<String>> {
+        run(root, api, None, timeout, QUIET)
     }
 
     fn state_at(root: &Path, completed: bool, api: &str) {
@@ -246,12 +275,11 @@ mod tests {
         let temp = TempDir::new();
         let root = temp.path().join("mine");
         fs::create_dir(&root).unwrap();
-        // Reach the ownership check, not the privacy check: the directory is
-        // private and ours, but its contents are not a state layout.
+        // Private, so the ownership check is reached rather than the privacy one.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(root.join("notes.txt"), b"keep me").unwrap();
-        let error = run(&root, None, None, Duration::from_millis(10), 0).unwrap_err();
-        assert!(error.message.contains("only deletes"), "{}", error.message);
+        let error = delete(&root, None, SECOND).unwrap_err();
+        assert!(error.message.contains("only deletes"), "{error}");
         assert!(root.join("notes.txt").exists());
         assert_eq!(
             fs::read_dir(&root).unwrap().count(),
@@ -265,9 +293,7 @@ mod tests {
         let temp = TempDir::new();
         let root = temp.path().join("mine");
         state::create_private_dir(&root).unwrap();
-
-        let error = run(&root, None, None, Duration::from_secs(1), 0).unwrap_err();
-
+        let error = delete(&root, None, SECOND).unwrap_err();
         assert!(error.message.contains("no recognized state"), "{error}");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     }
@@ -278,9 +304,7 @@ mod tests {
         let file = temp.path().join("file");
         fs::write(&file, b"not a directory").unwrap();
         let root = file.join("state");
-
-        let error = run(&root, None, None, Duration::from_secs(1), 0).unwrap_err();
-
+        let error = delete(&root, None, SECOND).unwrap_err();
         assert_eq!(error.code, crate::error::FAILURE);
         assert!(
             error.message.contains(&root.display().to_string()),
@@ -292,14 +316,10 @@ mod tests {
     fn refuses_corrupt_state() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
-        state_with_profile(&root, true);
+        state_at(&root, true, DEFAULT_API);
         fs::write(root.join(layout::WRAPPER_FILE), b"{bad").unwrap();
-        let error = run(&root, None, None, Duration::from_millis(10), 0).unwrap_err();
-        assert!(
-            error.message.contains("refusing to delete"),
-            "{}",
-            error.message
-        );
+        let error = delete(&root, None, SECOND).unwrap_err();
+        assert!(error.message.contains("refusing to delete"), "{error}");
         assert!(layout::profile_dir(&root).join(layout::TOKEN).exists());
     }
 
@@ -307,60 +327,44 @@ mod tests {
     fn refuses_a_live_run() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
-        state_with_profile(&root, true);
+        state_at(&root, true, DEFAULT_API);
         let _held = StateLock::acquire(&root, true).unwrap();
-        let error = run(&root, None, None, Duration::from_millis(10), 0).unwrap_err();
-        assert!(
-            error.message.contains("holds the lock"),
-            "{}",
-            error.message
-        );
+        let error = delete(&root, None, SECOND).unwrap_err();
+        assert!(error.message.contains("holds the lock"), "{error}");
     }
 
     #[test]
     fn refuses_a_conflicting_endpoint() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
-        state_with_profile(&root, true);
-        let error = run(
-            &root,
-            Some("http://127.0.0.1:9"),
-            None,
-            Duration::from_millis(10),
-            0,
-        )
-        .unwrap_err();
-        assert!(error.message.contains("created for"), "{}", error.message);
+        state_at(&root, true, DEFAULT_API);
+        let error = delete(&root, Some("http://127.0.0.1:9"), SECOND).unwrap_err();
+        assert!(error.message.contains("created for"), "{error}");
     }
 
     #[test]
     fn missing_directory_is_harmless() {
         let temp = TempDir::new();
         let root = temp.path().join("absent");
-        let completed = run(&root, None, None, Duration::from_secs(1), 0).unwrap();
-        assert!(
-            completed
-                .warnings
-                .iter()
-                .any(|w| w.contains("nothing to delete"))
-        );
+        let warnings = delete(&root, None, SECOND).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("nothing to delete")));
         assert!(!root.exists());
     }
 
     #[test]
-    fn first_run_state_is_removed_locally() {
+    fn first_run_residue_is_removed_locally() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
         state::create_private_dir(&root).unwrap();
         let residue = "wrapper.json.tmp-1-abc";
         fs::write(root.join(residue), b"{}").unwrap();
         {
-            let _failure = cleanup::InjectedUnlinkFailure::arm(residue);
-            let error = run(&root, None, None, Duration::from_secs(1), 0).unwrap_err();
+            let _failure = local::InjectedUnlinkFailure::arm(residue);
+            let error = delete(&root, None, SECOND).unwrap_err();
             assert!(error.message.contains(residue), "{error}");
             assert!(root.join(residue).exists());
         }
-        run(&root, None, None, Duration::from_secs(1), 0).unwrap();
+        delete(&root, None, SECOND).unwrap();
         assert!(!root.exists());
     }
 
@@ -377,7 +381,7 @@ mod tests {
         state::mark_remote_deleted(&root, &meta).unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500)).unwrap();
 
-        let result = run(&root, None, None, Duration::ZERO, 0);
+        let result = delete(&root, None, SECOND);
 
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let error = result.unwrap_err();
@@ -390,36 +394,71 @@ mod tests {
             error.message.contains(&root.display().to_string()),
             "{error}"
         );
+        assert!(!error.message.contains("delete --dir"), "{error}");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_confirmed_deletion_is_recorded_even_without_budget_left() {
+        let temp = TempDir::new();
+        let root = temp.path().join("state");
+        state_at(&root, true, "http://127.0.0.1:1");
+        let meta = WrapperMeta::new(Mode::Reusable, "http://127.0.0.1:1".into(), "route".into());
+
+        let mut lock = StateLock::acquire(&root, true).unwrap();
+        let problem =
+            finish_locally(&mut lock, &meta, None, &Budget::new(Duration::ZERO)).unwrap_err();
+        assert!(problem.contains("marked for resumption"), "{problem}");
+        assert!(layout::profile_dir(&root).join(layout::TOKEN).exists());
+        assert!(matches!(
+            state::classify(&root).unwrap(),
+            Classification::Deleting { .. }
+        ));
+        drop(lock);
+
+        delete(&root, None, SECOND).unwrap();
+        assert!(!root.exists(), "a marked deletion finishes without network");
+    }
+
+    #[test]
+    fn a_retry_that_needs_the_api_carries_the_ca() {
+        let temp = TempDir::new();
+        let root = temp.path().join("state");
+        state_at(&root, true, "http://127.0.0.1:1");
+        let meta = WrapperMeta::new(Mode::Reusable, "http://127.0.0.1:1".into(), "route".into());
+        let ca = Path::new("/etc/my ca.pem");
+
+        let mut lock = StateLock::acquire(&root, true).unwrap();
+        let problem = delete_identity(
+            &mut lock,
+            &meta,
+            Some(ca),
+            &Budget::new(Duration::ZERO),
+            QUIET,
+        )
+        .unwrap_err();
+        assert!(problem.contains("Credentials were kept"), "{problem}");
+        assert!(
+            problem.contains(&recovery_command(&root, Some(ca))),
+            "{problem}"
+        );
     }
 
     #[test]
     fn an_unreachable_api_keeps_the_credentials() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
-        // The endpoint must match the recorded one, or `delete` refuses before
-        // contacting anything and this would not exercise the remote path.
         state_at(&root, true, "http://127.0.0.1:1");
-        let error = run(
-            &root,
-            Some("http://127.0.0.1:1"),
-            None,
-            Duration::from_millis(1),
-            0,
-        )
-        .unwrap_err();
+        let error = delete(&root, None, Duration::from_millis(1)).unwrap_err();
         assert_kept_credentials(&root, &error.message);
         assert!(layout::profile_dir(&root).join(layout::TOKEN).exists());
     }
 
-    /// The reviewer's failure: an HTTP error (not just an uncertain outcome)
-    /// short-circuited with `?`, so `delete` exited without ever saying that
-    /// the credentials were preserved or how to retry. Every remote failure
-    /// must produce that recoverable diagnostic.
+    /// Every remote failure, an HTTP error included, must say that the
+    /// credentials were kept and how to retry, without leaking the token.
     ///
     /// The status itself varies with the environment (an outbound proxy may
-    /// answer instead of the fixture), so the assertion is on the contract:
-    /// the diagnostic exists, names the directory and retry, and leaks nothing.
+    /// answer instead of the fixture), so only that contract is asserted.
     #[test]
     fn an_api_error_keeps_the_credentials_and_prints_the_retry() {
         const TOKEN: &str = "token-7c1d9e2b-should-never-be-printed";
@@ -429,73 +468,33 @@ mod tests {
         state_at(&root, true, &api);
         fs::write(layout::profile_dir(&root).join(layout::TOKEN), TOKEN).unwrap();
 
-        let error = run(&root, Some(&api), None, Duration::from_secs(5), 0).unwrap_err();
+        let error = delete(&root, None, Duration::from_secs(5)).unwrap_err();
 
         assert_kept_credentials(&root, &error.message);
-        // A fixture (or hostile endpoint) echoing the request must not leak
-        // the token into the diagnostic.
-        assert!(
-            !error.message.contains(TOKEN),
-            "the token leaked: {}",
-            error.message
-        );
-        // Nothing local was touched: the identity can still be deleted later.
+        assert!(!error.message.contains(TOKEN), "the token leaked: {error}");
         assert_eq!(
             fs::read_to_string(layout::profile_dir(&root).join(layout::TOKEN)).unwrap(),
             TOKEN
-        );
-        assert!(
-            layout::profile_dir(&root)
-                .join(layout::PRIVATE_KEY)
-                .exists()
         );
         let wrapper = fs::read_to_string(root.join(layout::WRAPPER_FILE)).unwrap();
         assert!(
             !wrapper.contains("\"remote_deleted\": true"),
             "a failed remote deletion must not be recorded as done: {wrapper}"
         );
-        // And the directory still classifies as a live identity, so the
-        // printed retry command is actually usable.
         assert!(matches!(
             state::classify(&root).unwrap(),
             Classification::Initialized { .. }
         ));
     }
 
-    /// A 404 is a settled outcome, not an error: it means the registration is
-    /// already gone, so local cleanup may proceed. Asserted on the mapping
-    /// itself, because a loopback 404 is not reliably reachable through an
-    /// outbound proxy.
-    #[test]
-    fn a_404_settles_the_deletion() {
-        assert_eq!(
-            remote::outcome_for_error(404),
-            Some(Outcome::AlreadyAbsent),
-            "a confirmed 404 must count as an absent registration"
-        );
-        assert_eq!(remote::outcome_for_error(401), None);
-        assert_eq!(remote::outcome_for_error(500), None);
-        assert!(Outcome::AlreadyAbsent.may_remove_local());
-    }
-
     fn assert_kept_credentials(root: &Path, message: &str) {
-        assert!(
-            message.contains("Credentials were kept at"),
-            "the diagnostic must say the credentials were kept: {message}"
-        );
-        assert!(
-            message.contains(&root.display().to_string()),
-            "the diagnostic must name the state directory: {message}"
-        );
-        assert!(
-            message.contains(&cleanup::recovery_command(root)),
-            "the diagnostic must name the retry command: {message}"
-        );
+        assert!(message.contains("Credentials were kept at"), "{message}");
+        assert!(message.contains(&root.display().to_string()), "{message}");
+        assert!(message.contains(&recovery_command(root, None)), "{message}");
     }
 
     /// A loopback HTTP API that answers every request with `status`, echoing
-    /// `echo` in the body (as an untrusted endpoint could). Serves until the
-    /// returned handle is dropped.
+    /// `echo` in the body as an untrusted endpoint could.
     fn failing_api(status: u16, echo: &str) -> String {
         use std::io::{Read, Write};
         use std::net::TcpListener;

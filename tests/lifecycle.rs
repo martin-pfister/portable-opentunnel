@@ -13,68 +13,23 @@
 
 #[path = "support/fake_api.rs"]
 mod fake_api;
+#[path = "support/scratch.rs"]
+mod scratch;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use fake_api::FakeApi;
-
-// ---------------------------------------------------------------------------
-// Scratch directories
-// ---------------------------------------------------------------------------
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A unique private scratch root. The fixture writes its CA here, so it must be
-/// a real directory this user owns.
-struct Scratch {
-    root: PathBuf,
-}
+use scratch::{Scratch, binary};
 
 impl Scratch {
-    fn new() -> Self {
-        let base = std::env::var_os("TMPDIR")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp/opencode"));
-        fs::create_dir_all(&base).expect("creating the scratch base");
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default();
-        let root = base.join(format!(
-            "portable-opentunnel-lifecycle-{}-{}-{nonce}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).expect("creating the scratch root");
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-            .expect("making the scratch root private");
-
-        // A sanitized HOME and TMPDIR so the child never reads or writes the
-        // developer's real state.
-        for name in ["home", "tmp", "cwd"] {
-            let path = root.join(name);
-            fs::create_dir(&path).expect("creating a scratch subdirectory");
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                .expect("making a scratch subdirectory private");
-        }
-        Self { root }
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.root.join(name)
-    }
-
     /// The state directory a test operates on.
     fn state(&self) -> PathBuf {
         self.path("state")
@@ -82,7 +37,7 @@ impl Scratch {
 
     /// Finds the state directory created by this test's single ephemeral run.
     fn ephemeral_state(&self) -> PathBuf {
-        let mut entries = fs::read_dir(self.path("tmp")).unwrap();
+        let mut entries = fs::read_dir(self.tmp()).unwrap();
         let state = entries.next().expect("state under TMPDIR").unwrap().path();
         assert!(entries.next().is_none(), "one temporary state directory");
         assert!(state.join("wrapper.json").is_file());
@@ -90,22 +45,9 @@ impl Scratch {
     }
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The child process
 // ---------------------------------------------------------------------------
-
-fn binary() -> PathBuf {
-    match std::env::var_os("PORTABLE_OPENTUNNEL_TEST_BINARY") {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => PathBuf::from(env!("CARGO_BIN_EXE_portable-opentunnel")),
-    }
-}
 
 /// Environment variable the CI acceptance step uses to prove a *release*
 /// binary was actually exercised by this suite rather than only compiled.
@@ -181,9 +123,9 @@ impl Process {
         extra_env: &[(&str, &str)],
         context: &str,
     ) -> Self {
-        let home = scratch.path("home");
-        let tmp = scratch.path("tmp");
-        let cwd = scratch.path("cwd");
+        let home = scratch.home();
+        let tmp = scratch.tmp();
+        let cwd = scratch.cwd();
 
         let mut command = Command::new(binary());
         command
@@ -575,7 +517,7 @@ fn fixture_dual(scratch: &Scratch) -> (FakeApi, Backend) {
 
 fn fixture_with(scratch: &Scratch, backend: Backend) -> (FakeApi, Backend) {
     let api = FakeApi::start(
-        &scratch.root,
+        scratch.root(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], backend.port))),
     );
     (api, backend)
@@ -1510,7 +1452,7 @@ fn https_and_wss_with_the_fixture_ca_forwards() {
     let scratch = Scratch::new();
     let backend = Backend::start();
     let api = FakeApi::start_https(
-        &scratch.root,
+        scratch.root(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], backend.port))),
     );
     let state = body_dir(&scratch);
@@ -1551,7 +1493,7 @@ fn https_without_the_ca_fails_within_the_startup_deadline() {
     let scratch = Scratch::new();
     let backend = Backend::start();
     let api = FakeApi::start_https(
-        &scratch.root,
+        scratch.root(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], backend.port))),
     );
     let state = body_dir(&scratch);

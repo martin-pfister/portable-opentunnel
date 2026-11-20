@@ -1,19 +1,14 @@
-//! The thin layer between this program and the pinned SDK.
-//!
-//! Everything the wrapper needs from `opentunnel` is concentrated here:
-//! building a `Client` with an explicit endpoint and an explicitly located
-//! `Storage`, provisioning or resuming one profile, and rendering SDK errors
-//! with the right exit status.
+//! The thin layer between this program and the pinned SDK: building a
+//! `Client` with an explicit endpoint and storage location, inspecting the one
+//! profile, and rendering SDK errors without leaking secrets.
 
 use std::path::Path;
 
-use opentunnel::{
-    Client, ClientOptions, Error as SdkError, Identity, PendingIdentity, ProvisionStage, Storage,
-};
+use opentunnel::{Client, ClientOptions, Error as SdkError, ProvisionStage, Storage};
 use url::Url;
 
 use crate::error::{AppError, AppResult};
-use crate::layout;
+use crate::state::layout;
 
 /// Builds a client that stores exactly one profile under `<state>/sdk`.
 pub fn client(api: &str, state_root: &Path, ca_cert: Option<&Path>) -> AppResult<Client> {
@@ -26,31 +21,33 @@ pub fn client(api: &str, state_root: &Path, ca_cert: Option<&Path>) -> AppResult
     }))
 }
 
-/// The three states provisioning can be in after looking at the SDK files.
-#[derive(Debug)]
-pub enum Provisioned {
-    /// A complete identity is on disk.
-    Complete(Identity),
+/// What the SDK files hold, before provisioning starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Saved {
+    /// A complete identity.
+    Complete,
     /// A pending identity whose certificate was never issued.
-    Pending(PendingIdentity),
+    Pending,
     /// Nothing at all: the profile must be created.
     Absent,
 }
 
-pub fn inspect(client: &Client) -> AppResult<Provisioned> {
+/// Loads the saved identity the way the SDK will, so unreadable credentials
+/// fail here with a clear message.
+pub fn inspect(client: &Client) -> AppResult<Saved> {
     match client.get(layout::PROFILE) {
-        Ok(Some(identity)) => Ok(Provisioned::Complete(identity)),
+        Ok(Some(_)) => Ok(Saved::Complete),
         Ok(None) => match client.pending(layout::PROFILE) {
-            Ok(Some(pending)) => Ok(Provisioned::Pending(pending)),
-            Ok(None) => Ok(Provisioned::Absent),
+            Ok(Some(_)) => Ok(Saved::Pending),
+            Ok(None) => Ok(Saved::Absent),
             Err(error) => Err(sdk_error("reading the pending identity", error)),
         },
         Err(error) => Err(sdk_error("reading the saved identity", error)),
     }
 }
 
-/// Progress messages for provisioning, written to stderr only.
-pub fn describe(stage: ProvisionStage) -> &'static str {
+/// Progress messages for provisioning.
+pub fn describe_stage(stage: ProvisionStage) -> &'static str {
     match stage {
         ProvisionStage::CreatingTunnel => "creating the tunnel registration",
         ProvisionStage::GeneratingKey => "generating the local key",
@@ -73,13 +70,11 @@ pub fn is_credential_rejection(error: &SdkError) -> bool {
     }
 }
 
-/// Renders an SDK error as an `AppError`, keeping operational failures at 1.
+/// Renders an SDK error as an operational failure.
 ///
-/// The SDK's `Display` for transport errors is safe, but [`SdkError::Api`]
-/// embeds the server's own `message` field, which is untrusted text: a fixture
-/// or a misbehaving endpoint can echo the request (and therefore the saved
-/// token) straight back. Diagnostics must never carry secrets, so API failures
-/// are rendered from the status code and our own fixed wording only.
+/// [`SdkError::Api`] embeds the server's own `message` and `tag`, which are
+/// untrusted: an endpoint can echo the request, and with it the saved token.
+/// API failures are therefore rendered from the status code only.
 pub fn sdk_error(context: &str, error: SdkError) -> AppError {
     let hint = if is_credential_rejection(&error) {
         " The saved identity was rejected or no longer exists; it will not be replaced \
@@ -94,27 +89,8 @@ pub fn sdk_error(context: &str, error: SdkError) -> AppError {
 /// A secret-free description of an SDK error.
 fn describe_sdk_error(error: &SdkError) -> String {
     match error {
-        // Never the server's `message` or `tag`: both are untrusted and may
-        // quote the request.
         SdkError::Api { status, .. } => format!("the API answered with HTTP status {status}"),
         other => other.to_string(),
-    }
-}
-
-/// Serializable view of a pending identity, for diagnostics that must never
-/// include the token, key, or CSR.
-#[derive(Debug, serde::Serialize)]
-pub struct PendingSummary {
-    pub id: String,
-    pub hostname: String,
-}
-
-impl From<&PendingIdentity> for PendingSummary {
-    fn from(pending: &PendingIdentity) -> Self {
-        Self {
-            id: pending.id.clone(),
-            hostname: pending.hostname.clone(),
-        }
     }
 }
 
@@ -136,9 +112,9 @@ mod tests {
     fn inspect_reports_absent_then_pending() {
         let temp = TempDir::new();
         let client = client("http://127.0.0.1:1", temp.path(), None).unwrap();
-        assert!(matches!(inspect(&client).unwrap(), Provisioned::Absent));
+        assert_eq!(inspect(&client).unwrap(), Saved::Absent);
 
-        let pending = PendingIdentity {
+        let pending = opentunnel::PendingIdentity {
             id: "abc".into(),
             hostname: "abc.test".into(),
             token: "secret-token".into(),
@@ -149,10 +125,7 @@ mod tests {
             .storage()
             .save_pending(layout::PROFILE, &pending)
             .unwrap();
-        match inspect(&client).unwrap() {
-            Provisioned::Pending(found) => assert_eq!(found.id, "abc"),
-            other => panic!("expected pending, got {other:?}"),
-        }
+        assert_eq!(inspect(&client).unwrap(), Saved::Pending);
     }
 
     #[test]
@@ -174,25 +147,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_summary_omits_secrets() {
-        let pending = PendingIdentity {
-            id: "abc".into(),
-            hostname: "abc.test".into(),
-            token: "secret-token".into(),
-            private_key: "KEY".into(),
-            csr: "CSR".into(),
-        };
-        let json = serde_json::to_string(&PendingSummary::from(&pending)).unwrap();
-        assert!(!json.contains("secret-token"));
-        assert!(!json.contains("KEY"));
-        assert!(!json.contains("CSR"));
-        assert!(json.contains("abc.test"));
-    }
-
-    /// The API's own `message` is untrusted: an endpoint (or a fixture) can
-    /// echo the bearer token back in an error body. Diagnosed errors must never
-    /// reproduce it.
-    #[test]
     fn api_errors_never_echo_the_request_or_its_token() {
         let token = "token-abcdef123456";
         let error = SdkError::Api {
@@ -212,7 +166,6 @@ mod tests {
             rendered.message
         );
         assert!(!rendered.message.contains("rejected bearer"));
-        // It still says something useful, and it keeps the documented hint.
         assert!(rendered.message.contains("HTTP status 401"));
         assert!(rendered.message.contains("will not be replaced"));
         assert_eq!(rendered.code, crate::error::FAILURE);
@@ -220,8 +173,6 @@ mod tests {
 
     #[test]
     fn non_api_errors_keep_their_own_message() {
-        // Transport and validation errors are ours or the transport's, and they
-        // never carry request bodies, so their text stays available.
         let rendered = sdk_error("starting the bridge", SdkError::Attach("bad_token".into()));
         assert!(rendered.message.contains("bad_token"));
         assert!(rendered.message.contains("starting the bridge"));

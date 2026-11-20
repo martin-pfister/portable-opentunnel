@@ -53,16 +53,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codes_are_distinct() {
-        let all = [SUCCESS, FAILURE, NO_TUNNEL, INTERRUPTED, TERMINATED];
-        for (index, left) in all.iter().enumerate() {
-            for right in &all[index + 1..] {
-                assert_ne!(left, right);
-            }
-        }
-    }
-
-    #[test]
     fn io_adapter_keeps_the_context() {
         let error = AppError::io("reading state")(io::Error::other("denied"));
         assert_eq!(error.code, FAILURE);

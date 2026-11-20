@@ -68,7 +68,8 @@ swap, core dumps, or files and logs written by other programs.
 - **To retire the URL:** run `delete --dir DIR`. The API must confirm
   deletion or return 404 before local credentials are removed. If a timeout,
   transport error, or other API status prevents confirmation, the credentials
-  stay in place. Retry with the same directory and CA settings. A 401/403
+  stay in place and stderr shows the `delete` command to retry with,
+  including `--ca-cert` when an extra CA was in use. A 401/403
   does not confirm removal and retrying with the same rejected credentials
   may not help; contact the service operator if the rejection persists.
 - **If deletion was marked but local cleanup stopped:** retry `delete`; it

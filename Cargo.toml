@@ -24,7 +24,6 @@ tokio = { version = "1.53.2", features = [
 ] }
 url = "2.5.7"
 libc = "0.2.177"
-tracing = "0.1.44"
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = [

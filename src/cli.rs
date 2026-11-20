@@ -2,14 +2,13 @@
 //! filesystem or network access, so it is fully unit-testable.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
-use crate::error::{AppError, AppResult};
+use crate::output::Log;
 
-pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
-pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_STARTUP_SECONDS: u64 = 600;
+const DEFAULT_SHUTDOWN_SECONDS: u64 = 15;
 
 const BUILD_ID: &str = match option_env!("PORTABLE_OPENTUNNEL_BUILD_ID") {
     Some(id) if !id.is_empty() => id,
@@ -58,8 +57,16 @@ pub struct NetworkArgs {
     pub api: Option<String>,
 
     /// Print more diagnostics (credentials are never printed)
-    #[arg(long, action = ArgAction::Count)]
-    pub verbose: u8,
+    #[arg(long, overrides_with = "verbose")]
+    pub verbose: bool,
+}
+
+impl NetworkArgs {
+    pub fn log(&self) -> Log {
+        Log {
+            verbose: self.verbose,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -68,7 +75,7 @@ pub struct RunArgs {
     pub network: NetworkArgs,
 
     /// Total seconds to wait for provisioning and, if forwarding, attachment
-    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_STARTUP_TIMEOUT.as_secs(),
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_STARTUP_SECONDS,
         value_parser = clap::value_parser!(u64).range(1..))]
     pub startup_timeout: u64,
 
@@ -79,7 +86,7 @@ pub struct RunArgs {
 #[derive(Debug, Args)]
 pub struct ShutdownArgs {
     /// Seconds allowed for shutdown or deletion
-    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT.as_secs(),
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_SHUTDOWN_SECONDS,
         value_parser = clap::value_parser!(u64).range(1..))]
     pub shutdown_timeout: u64,
 }
@@ -153,10 +160,10 @@ impl std::fmt::Display for Target {
 
 /// Parses `3000`, `127.0.0.1:8080`, `localhost:8080`, `example.test:443`, or
 /// `[::1]:8080`.
-pub fn parse_target(value: &str) -> AppResult<Target> {
+pub fn parse_target(value: &str) -> Result<Target, String> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(AppError::new(2, "the local target is empty"));
+        return Err("the local target is empty".to_owned());
     }
 
     // A bare port, with no host part.
@@ -170,57 +177,44 @@ pub fn parse_target(value: &str) -> AppResult<Target> {
 
     let (host, port) = if let Some(rest) = value.strip_prefix('[') {
         let (host, after) = rest.split_once(']').ok_or_else(|| {
-            AppError::new(
-                2,
-                format!("invalid target '{value}': a bracketed IPv6 address must end with ']'"),
-            )
+            format!("invalid target '{value}': a bracketed IPv6 address must end with ']'")
         })?;
-        let port = after.strip_prefix(':').ok_or_else(|| {
-            AppError::new(2, format!("invalid target '{value}': expected [IPv6]:port"))
-        })?;
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("invalid target '{value}': expected [IPv6]:port"))?;
         if host.is_empty()
             || !host
                 .chars()
                 .all(|ch| ch.is_ascii_hexdigit() || ch == ':' || ch == '.')
         {
-            return Err(AppError::new(
-                2,
-                format!("invalid target '{value}': '{host}' is not an IPv6 address"),
+            return Err(format!(
+                "invalid target '{value}': '{host}' is not an IPv6 address"
             ));
         }
         if host.matches(':').count() < 2 && !host.contains('.') {
-            return Err(AppError::new(
-                2,
-                format!("invalid target '{value}': '{host}' is not a full IPv6 address"),
+            return Err(format!(
+                "invalid target '{value}': '{host}' is not a full IPv6 address"
             ));
         }
         (host.to_owned(), port)
     } else {
-        let (host, port) = value.rsplit_once(':').ok_or_else(|| {
-            AppError::new(
-                2,
-                format!("invalid target '{value}': use a port or host:port"),
-            )
-        })?;
+        let (host, port) = value
+            .rsplit_once(':')
+            .ok_or_else(|| format!("invalid target '{value}': use a port or host:port"))?;
         if host.is_empty() {
-            return Err(AppError::new(
-                2,
-                format!("invalid target '{value}': the host is empty"),
-            ));
+            return Err(format!("invalid target '{value}': the host is empty"));
         }
         if host.contains(':') {
-            return Err(AppError::new(
-                2,
-                format!("invalid target '{value}': bracket an IPv6 address as [addr]:port"),
+            return Err(format!(
+                "invalid target '{value}': bracket an IPv6 address as [addr]:port"
             ));
         }
         if !host
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
         {
-            return Err(AppError::new(
-                2,
-                format!("invalid target '{value}': '{host}' is not a hostname or address"),
+            return Err(format!(
+                "invalid target '{value}': '{host}' is not a hostname or address"
             ));
         }
         (host.to_owned(), port)
@@ -230,33 +224,30 @@ pub fn parse_target(value: &str) -> AppResult<Target> {
     Ok(Target { host, port })
 }
 
-fn parse_port(value: &str) -> AppResult<u16> {
-    let port: u16 = value.parse().map_err(|_| {
-        AppError::new(
-            2,
-            format!("invalid port '{value}': expected a number from 1 to 65535"),
-        )
-    })?;
+fn parse_port(value: &str) -> Result<u16, String> {
+    let port: u16 = value
+        .parse()
+        .map_err(|_| format!("invalid port '{value}': expected a number from 1 to 65535"))?;
     if port == 0 {
-        return Err(AppError::new(2, "invalid port '0': expected 1 to 65535"));
+        return Err("invalid port '0': expected 1 to 65535".to_owned());
     }
     Ok(port)
 }
 
-fn parse_api(api: &str) -> AppResult<String> {
-    let url = url::Url::parse(api).map_err(|error| AppError::new(2, error.to_string()))?;
+fn parse_api(api: &str) -> Result<String, String> {
+    let url = url::Url::parse(api).map_err(|error| error.to_string())?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(AppError::new(2, "only http and https are supported"));
+        return Err("only http and https are supported".to_owned());
     }
     if url.host().is_none() {
-        return Err(AppError::new(2, "the URL has no host"));
+        return Err("the URL has no host".to_owned());
     }
     // The SDK joins absolute API paths onto the base, discarding any prefix.
     if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
-        return Err(AppError::new(
-            2,
-            "use an origin only, such as http://127.0.0.1:8080, without a path, query, or fragment",
-        ));
+        return Err(
+            "use an origin only, such as http://127.0.0.1:8080, without a path, query, or fragment"
+                .to_owned(),
+        );
     }
     Ok(api.to_owned())
 }
@@ -414,6 +405,13 @@ mod tests {
             assert_eq!(error.exit_code(), 2, "{api} should be rejected");
             assert!(error.to_string().contains("origin only"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_repeated_verbose_flag_is_accepted() {
+        let cli =
+            Cli::try_parse_from(["p", "delete", "--dir", "s", "--verbose", "--verbose"]).unwrap();
+        assert!(matches!(cli.command, Command::Delete { network, .. } if network.verbose));
     }
 
     #[test]

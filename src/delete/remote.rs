@@ -1,31 +1,22 @@
 //! Remote deletion of a tunnel registration.
 //!
-//! Deletion always runs on a **fresh** current-thread runtime with a **new**
-//! SDK `Client`, constructed inside that runtime: the forwarding runtime may be
-//! shutting down, and reusing its connection pool, TLS state, or runtime-bound
-//! I/O would be unsound. That is also why local state is removed only after the
-//! remote call is settled.
+//! Deletion runs on a fresh current-thread runtime with a new SDK `Client`
+//! built inside it: the forwarding runtime may be shutting down, and reusing
+//! its connection pool, TLS state, or runtime-bound I/O would be unsound.
 //!
-//! This module only ever touches the network. It deliberately does **not** call
-//! the SDK's `Storage::remove`, which recursively deletes the profile directory:
-//! a profile may contain entries this program does not own (the state
-//! classifier tolerates unknown files alongside a valid wrapper), and a
-//! recursive delete would destroy them. Local removal stays in
-//! [`crate::cleanup`], which deletes recognized entries one by one and retains
-//! everything else.
-//!
-//! The pinned SDK's `Client::remove` skips the server call for a pending-only
-//! identity and then removes the profile directory, so pending identities are
-//! deleted explicitly through `client.api().remove` as well.
+//! This module only touches the network. The SDK's `Client::remove` is not
+//! used: it skips the server call for a pending-only identity, and it removes
+//! the profile recursively, destroying entries this program does not own.
+//! Local removal is [`super::local`]'s job.
 
 use std::path::Path;
 use std::time::Instant;
 
-use opentunnel::{Error as SdkError, Identity, PendingIdentity};
+use opentunnel::Error as SdkError;
 
-use crate::bridge::{self, client as build_client};
 use crate::error::{AppError, AppResult};
-use crate::layout;
+use crate::sdk;
+use crate::state::layout;
 
 /// What the remote deletion achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +45,7 @@ impl Outcome {
             Outcome::Deleted => "the tunnel registration was deleted",
             Outcome::AlreadyAbsent => "the tunnel registration was already absent",
             Outcome::Nothing => "no saved identity needed deletion",
-            Outcome::Uncertain => {
-                "the deletion request's outcome is unknown; credentials were kept so another \
-                 attempt can confirm it"
-            }
+            Outcome::Uncertain => "the deletion request's outcome is unknown",
         }
     }
 }
@@ -72,11 +60,8 @@ pub struct Request<'a> {
 
 /// Requests deletion of the saved registration, if any, and nothing else.
 ///
-/// Runs blocking: it owns a private runtime and shuts it down before returning,
-/// so no SDK task that can write credentials outlives the call. Unrelated
-/// blocking work, such as a hostname lookup, may still outlive a background
-/// shutdown; that is why local files are only ever deleted by
-/// [`crate::cleanup`] after this has returned.
+/// Blocks on a private runtime and shuts it down before returning, so no SDK
+/// task that can write credentials outlives the call.
 pub fn delete_saved_identity(request: Request<'_>) -> AppResult<Outcome> {
     let Request {
         api,
@@ -104,25 +89,19 @@ async fn remote_only(
     ca_cert: Option<&Path>,
     deadline: Instant,
 ) -> AppResult<Outcome> {
-    let client = build_client(api, state_root, ca_cert)?;
+    let client = sdk::client(api, state_root, ca_cert)?;
 
-    // A complete identity is the normal case.
-    let identity: Option<Identity> = client
+    let saved = client
         .get(layout::PROFILE)
-        .map_err(|error| bridge::sdk_error("reading the saved identity", error))?;
-    let pending: Option<PendingIdentity> = client
-        .pending(layout::PROFILE)
-        .map_err(|error| bridge::sdk_error("reading the pending identity", error))?;
-
-    let Some((token, id)) = identity
-        .as_ref()
-        .map(|identity| (identity.token.clone(), identity.id.clone()))
-        .or_else(|| {
-            pending
-                .as_ref()
-                .map(|pending| (pending.token.clone(), pending.id.clone()))
-        })
-    else {
+        .map_err(|error| sdk::sdk_error("reading the saved identity", error))?;
+    let credentials = match saved {
+        Some(identity) => Some((identity.token, identity.id)),
+        None => client
+            .pending(layout::PROFILE)
+            .map_err(|error| sdk::sdk_error("reading the pending identity", error))?
+            .map(|pending| (pending.token, pending.id)),
+    };
+    let Some((token, id)) = credentials else {
         return Ok(Outcome::Nothing);
     };
 
@@ -132,45 +111,23 @@ async fn remote_only(
     }
     match tokio::time::timeout_at(deadline.into(), client.api().remove(&token, &id)).await {
         Ok(Ok(())) => Ok(Outcome::Deleted),
-        // A confirmed 404 means the registration is gone already.
-        Ok(Err(error)) => Ok(match outcome_for_error(status_of(&error)) {
-            Some(outcome) => outcome,
-            None => return Err(bridge::sdk_error("deleting the tunnel registration", error)),
-        }),
-        // A timeout is an uncertain outcome: keep credentials.
+        Ok(Err(error)) if is_not_found(&error) => Ok(Outcome::AlreadyAbsent),
+        Ok(Err(error)) => Err(sdk::sdk_error("deleting the tunnel registration", error)),
         Err(_) => Ok(Outcome::Uncertain),
     }
 }
 
-/// The HTTP status of an API error, if the failure was one.
-fn status_of(error: &SdkError) -> u16 {
-    match error {
-        SdkError::Api { status, .. } => *status,
-        _ => 0,
-    }
-}
-
-/// How a non-success API status maps onto a deletion outcome.
-///
-/// Only a *confirmed* 404 means the registration is gone. Everything else —
-/// 401/403 included, since a rejected token does not prove the tunnel was
-/// removed — stays an error, so no local file is deleted on an inference.
-pub fn outcome_for_error(status: u16) -> Option<Outcome> {
-    (status == 404).then_some(Outcome::AlreadyAbsent)
+/// Only a confirmed 404 means the registration is gone. Everything else,
+/// 401/403 included, stays an error: a rejected token does not prove the tunnel
+/// was removed, so no local file may be deleted on that inference.
+fn is_not_found(error: &SdkError) -> bool {
+    matches!(error, SdkError::Api { status: 404, .. })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    #[test]
-    fn outcomes_gate_local_removal() {
-        assert!(Outcome::Deleted.may_remove_local());
-        assert!(Outcome::AlreadyAbsent.may_remove_local());
-        assert!(Outcome::Nothing.may_remove_local());
-        assert!(!Outcome::Uncertain.may_remove_local());
-    }
 
     #[test]
     fn a_zero_deadline_is_uncertain_without_contacting_the_api() {
@@ -201,7 +158,20 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_remote_delete_never_removes_local_files() {
+    fn only_a_404_settles_a_failed_request() {
+        let api = |status| SdkError::Api {
+            status,
+            tag: String::new(),
+            message: String::new(),
+        };
+        assert!(is_not_found(&api(404)));
+        assert!(!is_not_found(&api(401)));
+        assert!(!is_not_found(&api(500)));
+        assert!(!is_not_found(&SdkError::Invalid("x".into())));
+    }
+
+    #[test]
+    fn local_files_are_never_removed() {
         let temp = crate::test_support::TempDir::new();
         let root = temp.path().join("state");
         crate::state::create_private_dir(&root).unwrap();
@@ -210,8 +180,6 @@ mod tests {
         for name in [layout::TOKEN, layout::TUNNEL] {
             std::fs::write(profile.join(name), b"secret").unwrap();
         }
-        // No complete identity can be read, so this returns `Nothing`; the point
-        // of the assertion is that no path in this module deletes files.
         let _ = delete_saved_identity(Request {
             api: "http://127.0.0.1:1",
             state_root: &root,

@@ -30,7 +30,7 @@ not a guarantee for newer releases.
   marker before removing recognized local files; preserve unrelated entries.
 - **State is private and locked by the wrapper.** Check the storage root,
   file modes, atomic writes, and temporary names against
-  [`src/layout.rs`](../src/layout.rs). The wrapper relies on `tunnel.json`
+  [`src/state/layout.rs`](../src/state/layout.rs). The wrapper relies on `tunnel.json`
   being committed last and on older state remaining readable, including
   pending credentials. The SDK does not lock the profile.
 - **Observe status without taking the task handle.** `Connected` means

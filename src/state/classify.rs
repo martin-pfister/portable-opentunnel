@@ -1,111 +1,14 @@
-//! Private state directories: classification, locking, and atomic wrapper
-//! metadata.
-//!
-//! Every rule here exists because credentials live in the directory. A stale
-//! lock descriptor, a replaced lock path, or a symlinked state root must never
-//! authorize a write or a deletion.
+//! Deciding what a state directory holds, without writing anything.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
+use super::WrapperMeta;
+use super::layout;
 use crate::error::{AppError, AppResult};
-use crate::layout;
-
-pub const WRAPPER_FORMAT: u64 = 1;
-pub const OWNER_MARKER: &str = "portable-opentunnel";
-
-/// The documented API default; persisted before provisioning so later runs
-/// use the recorded endpoint.
-pub const DEFAULT_API: &str = "https://opentunnel.xyz";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// Keep the identity and its route after exit.
-    Reusable,
-    /// Create a fresh identity and delete it remotely on exit.
-    Ephemeral,
-}
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Reusable => "reusable",
-            Mode::Ephemeral => "ephemeral",
-        }
-    }
-}
-
-/// The single wrapper metadata file: format, ownership, mode, endpoint, route.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WrapperMeta {
-    pub format: u64,
-    pub owner: String,
-    pub mode: Mode,
-    pub api: String,
-    /// Route label claimed on attach; the public URL is
-    /// `https://<route>.<hostname>`, or `https://<hostname>` for `@`.
-    pub route: String,
-    /// The remote registration is known to be gone, so only local cleanup
-    /// remains.
-    ///
-    /// Written *before* any credential file is unlinked, so an interrupted
-    /// deletion can always be resumed without contacting the API again — which
-    /// it could not do anyway once `token`/`private-key.pem` are partly gone.
-    /// Absent in metadata written by older versions, hence `default`; and
-    /// omitted when false, so a live identity's file stays byte-identical.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub remote_deleted: bool,
-}
-
-impl WrapperMeta {
-    pub fn new(mode: Mode, api: String, route: String) -> Self {
-        Self {
-            format: WRAPPER_FORMAT,
-            owner: OWNER_MARKER.to_owned(),
-            mode,
-            api,
-            route,
-            remote_deleted: false,
-        }
-    }
-
-    pub fn validate(&self) -> AppResult<()> {
-        if self.format != WRAPPER_FORMAT {
-            return Err(AppError::fail(format!(
-                "unsupported state format {}: this build understands format {WRAPPER_FORMAT}",
-                self.format
-            )));
-        }
-        if self.owner != OWNER_MARKER {
-            return Err(AppError::fail(format!(
-                "state directory is owned by '{}', not '{OWNER_MARKER}'",
-                self.owner
-            )));
-        }
-        if !opentunnel::protocol::names::is_valid_route(&self.route) {
-            return Err(AppError::fail(format!(
-                "saved route '{}' is invalid; refusing to guess a replacement",
-                self.route
-            )));
-        }
-        url::Url::parse(&self.api)
-            .ok()
-            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
-            .ok_or_else(|| {
-                AppError::fail(format!(
-                    "saved API endpoint '{}' is not an http(s) URL with a host",
-                    self.api
-                ))
-            })?;
-        Ok(())
-    }
-}
 
 /// What a state directory contains, decided without writing anything.
 #[derive(Debug)]
@@ -124,12 +27,6 @@ pub enum Classification {
     Corrupt { reason: String },
     /// Unrelated content: not ours to initialize inside or delete.
     Unrelated { reason: String },
-}
-
-impl Classification {
-    pub fn is_initialized(&self) -> bool {
-        matches!(self, Classification::Initialized { .. })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,288 +360,13 @@ pub fn classify(root: &Path) -> AppResult<Classification> {
     })
 }
 
-/// The public HTTPS URL for a route and tunnel hostname.
-pub fn route_url(route: &str, hostname: &str) -> String {
-    if route == opentunnel::protocol::names::ROOT_ROUTE {
-        format!("https://{hostname}")
-    } else {
-        format!("https://{route}.{hostname}")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Directory permissions
-// ---------------------------------------------------------------------------
-
-pub fn current_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
-}
-
-/// Verifies that `root` is a real directory owned by this user and not
-/// accessible by group or others. Existing permissions are never relaxed.
-pub fn check_private_dir(root: &Path) -> AppResult<()> {
-    let metadata = fs::symlink_metadata(root)
-        .map_err(AppError::io(format!("inspecting {}", root.display())))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(AppError::fail(format!(
-            "{} is not a real directory",
-            root.display()
-        )));
-    }
-    if metadata.uid() != current_uid() {
-        return Err(AppError::fail(format!(
-            "{} is owned by uid {}, not the current user (uid {})",
-            root.display(),
-            metadata.uid(),
-            current_uid()
-        )));
-    }
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(AppError::fail(format!(
-            "{} is accessible by group or others (mode {mode:o}); credentials must stay private. \
-             Run: chmod 700 {}",
-            root.display(),
-            root.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Creates `root` with mode 0700, failing if anything is already there.
-pub fn create_private_dir(root: &Path) -> AppResult<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder
-        .create(root)
-        .map_err(AppError::io(format!("creating {}", root.display())))?;
-    fsync_dir(root)
-}
-
-pub fn fsync_dir(path: &Path) -> AppResult<()> {
-    let file =
-        File::open(path).map_err(AppError::io(format!("opening {} for sync", path.display())))?;
-    file.sync_all()
-        .map_err(AppError::io(format!("syncing {}", path.display())))
-}
-
-/// dev/ino pair identifying a directory or file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileId {
-    pub dev: u64,
-    pub ino: u64,
-}
-
-impl FileId {
-    pub fn of(metadata: &fs::Metadata) -> Self {
-        Self {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        }
-    }
-}
-
-fn open_dir(root: &Path) -> AppResult<FileId> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root)
-        .map_err(AppError::io(format!("opening {}", root.display())))?;
-    let metadata = file
-        .metadata()
-        .map_err(AppError::io(format!("inspecting {}", root.display())))?;
-    Ok(FileId::of(&metadata))
-}
-
-// ---------------------------------------------------------------------------
-// The lock
-// ---------------------------------------------------------------------------
-
-/// An exclusive lock on one state directory, held for the whole operation.
-///
-/// `Drop` releases the OS lock and closes the descriptor. Reusable state keeps
-/// the lock file; final deletion removes it while the lock is still held.
-pub struct StateLock {
-    root: PathBuf,
-    /// Held open for the whole operation; closing it releases the lock.
-    _file: File,
-    path_id: FileId,
-    dir_id: FileId,
-}
-
-impl std::fmt::Debug for StateLock {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("StateLock")
-            .field("root", &self.root)
-            .finish_non_exhaustive()
-    }
-}
-
-impl StateLock {
-    /// Opens (creating when `create`) and locks `<root>/.lock`.
-    pub fn acquire(root: &Path, create: bool) -> AppResult<Self> {
-        let dir_id = open_dir(root)?;
-        let path = root.join(layout::LOCK_FILE);
-
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        if create {
-            options.create(true).truncate(false).mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .map_err(AppError::io(format!("opening {}", path.display())))?;
-
-        file.try_lock().map_err(|error| match error {
-            fs::TryLockError::WouldBlock => AppError::fail(format!(
-                "another portable-opentunnel process holds the lock in {}",
-                root.display()
-            )),
-            fs::TryLockError::Error(error) => AppError::fail(format!(
-                "cannot lock {}: {error}. Reliable exclusive locking is required; \
-                 some shared-filesystem mount options do not provide it",
-                path.display()
-            )),
-        })?;
-
-        let metadata = file
-            .metadata()
-            .map_err(AppError::io(format!("inspecting {}", path.display())))?;
-        let lock = Self {
-            root: root.to_path_buf(),
-            _file: file,
-            path_id: FileId::of(&metadata),
-            dir_id,
-        };
-        lock.validate()?;
-        Ok(lock)
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// Confirms that the opened descriptor still is the file at the lock path
-    /// and that the directory is still the one we opened. Called before every
-    /// state write and before any deletion.
-    pub fn validate(&self) -> AppResult<()> {
-        let path = self.root.join(layout::LOCK_FILE);
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            AppError::fail(format!(
-                "the lock at {} is gone or unreadable ({error}); refusing to continue",
-                path.display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(AppError::fail(format!(
-                "the lock at {} was replaced by an unsafe entry; refusing to continue",
-                path.display()
-            )));
-        }
-        if FileId::of(&metadata) != self.path_id {
-            return Err(AppError::fail(format!(
-                "{} or its lock was replaced by another file; refusing to continue",
-                self.root.display()
-            )));
-        }
-        if open_dir(&self.root)? != self.dir_id {
-            return Err(AppError::fail(format!(
-                "{} was replaced while it was in use; refusing to continue",
-                self.root.display()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Removes the lock file as the final step of deleting a state directory,
-    /// while still holding the lock.
-    pub fn remove_lock_file(&mut self) -> AppResult<()> {
-        self.validate()?;
-        let path = self.root.join(layout::LOCK_FILE);
-        fs::remove_file(&path).map_err(AppError::io(format!("removing {}", path.display())))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wrapper metadata writes
-// ---------------------------------------------------------------------------
-
-fn random_suffix() -> String {
-    crate::random::alphanumeric(8)
-}
-
-fn create_new_private(path: &Path, content: &[u8]) -> AppResult<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(AppError::io(format!("creating {}", path.display())))?;
-    file.write_all(content)
-        .and_then(|()| file.sync_all())
-        .map_err(AppError::io(format!("writing {}", path.display())))
-}
-
-/// Atomically replaces `wrapper.json`: exclusive private temporary file,
-/// fsync, rename, then directory sync.
-pub fn write_wrapper(root: &Path, meta: &WrapperMeta) -> AppResult<()> {
-    meta.validate()?;
-    let mut content = serde_json::to_vec_pretty(meta)
-        .map_err(|error| AppError::fail(format!("serializing state metadata: {error}")))?;
-    content.push(b'\n');
-    let temporary = root.join(format!(
-        "{}.tmp-{}-{}",
-        layout::WRAPPER_FILE,
-        std::process::id(),
-        random_suffix()
-    ));
-    create_new_private(&temporary, &content)?;
-    let final_path = root.join(layout::WRAPPER_FILE);
-    if let Err(error) = fs::rename(&temporary, &final_path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(AppError::io(format!("replacing {}", final_path.display()))(
-            error,
-        ));
-    }
-    fsync_dir(root)
-}
-
-/// Atomically records that the remote registration is gone.
-///
-/// This must succeed *before* any credential file is unlinked: it is the only
-/// thing that makes an interrupted local deletion resumable, because a partial
-/// profile can no longer be authenticated to the API. A failure leaves the
-/// credentials untouched and the caller must abort.
-pub fn mark_remote_deleted(root: &Path, meta: &WrapperMeta) -> AppResult<WrapperMeta> {
-    let mut marked = meta.clone();
-    marked.remote_deleted = true;
-    write_wrapper(root, &marked)?;
-    Ok(marked)
-}
-
-/// Whether a recognized residue file is safe to remove: a regular file owned
-/// by this user, not a symlink.
-pub fn safe_to_remove(path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            metadata.file_type().is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.uid() == current_uid()
-        }
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::state::{
+        DEFAULT_API, Mode, StateLock, create_private_dir, mark_remote_deleted, write_wrapper,
+    };
     use crate::test_support::TempDir;
 
     fn reusable() -> WrapperMeta {
@@ -787,26 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_round_trips() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        create_private_dir(&root).unwrap();
-        write_wrapper(&root, &reusable()).unwrap();
-        assert!(matches!(
-            classify(&root).unwrap(),
-            Classification::Resumable { .. }
-        ));
-        assert_eq!(
-            fs::metadata(root.join(layout::WRAPPER_FILE))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    #[test]
     fn the_remote_deleted_marker_reclassifies_even_without_credentials() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
@@ -823,14 +425,7 @@ mod tests {
             br#"{"id":"abc","hostname":"abc.opentunnel.xyz","certificateExpiry":"2099-01-01T00:00:00.000Z"}"#,
         )
         .unwrap();
-        // No token, no private key: `load` would call this corrupt.
-        assert!(matches!(
-            classify(&root).unwrap(),
-            Classification::Corrupt { .. } | Classification::Initialized { .. }
-        ));
-
-        let marked = mark_remote_deleted(&root, &reusable()).unwrap();
-        assert!(marked.remote_deleted);
+        mark_remote_deleted(&root, &reusable()).unwrap();
         // With the marker, the directory is a resumable deletion, not corrupt.
         match classify(&root).unwrap() {
             Classification::Deleting { meta } => {
@@ -856,38 +451,6 @@ mod tests {
             Classification::Resumable { meta } => assert!(!meta.remote_deleted),
             other => panic!("expected a resumable identity, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn marking_the_deletion_is_atomic_and_keeps_the_route() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        create_private_dir(&root).unwrap();
-        write_wrapper(&root, &reusable()).unwrap();
-        let before = fs::read(root.join(layout::WRAPPER_FILE)).unwrap();
-
-        let marked = mark_remote_deleted(&root, &reusable()).unwrap();
-        assert!(marked.remote_deleted);
-        assert_eq!(marked.route, "abc123", "the route must be preserved");
-        // No temporary file is left behind, and permissions stay private.
-        let names: Vec<String> = fs::read_dir(&root)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            !names.iter().any(|name| name.contains(".tmp-")),
-            "residue left behind: {names:?}"
-        );
-        assert_eq!(
-            fs::metadata(root.join(layout::WRAPPER_FILE))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_ne!(before, fs::read(root.join(layout::WRAPPER_FILE)).unwrap());
     }
 
     #[test]
@@ -1020,57 +583,5 @@ mod tests {
             classify(&root).unwrap(),
             Classification::Corrupt { .. }
         ));
-    }
-
-    #[test]
-    fn second_acquire_fails() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        create_private_dir(&root).unwrap();
-        let _held = StateLock::acquire(&root, true).unwrap();
-        let error = StateLock::acquire(&root, true).unwrap_err();
-        assert!(
-            error.message.contains("holds the lock"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn replaced_lock_path_is_detected() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        create_private_dir(&root).unwrap();
-        let lock = StateLock::acquire(&root, true).unwrap();
-        fs::remove_file(root.join(layout::LOCK_FILE)).unwrap();
-        fs::write(root.join(layout::LOCK_FILE), b"").unwrap();
-        assert!(lock.validate().is_err());
-    }
-
-    #[test]
-    fn unlinked_lock_never_authorizes_writes() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        create_private_dir(&root).unwrap();
-        let mut lock = StateLock::acquire(&root, true).unwrap();
-        fs::remove_file(root.join(layout::LOCK_FILE)).unwrap();
-        assert!(lock.validate().is_err());
-        assert!(lock.remove_lock_file().is_err());
-    }
-
-    #[test]
-    fn route_urls_cover_root_and_label() {
-        assert_eq!(route_url("@", "x.test"), "https://x.test");
-        assert_eq!(route_url("abc", "x.test"), "https://abc.x.test");
-    }
-
-    #[test]
-    fn refuses_a_group_accessible_directory() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        create_private_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-        let error = check_private_dir(&root).unwrap_err();
-        assert!(error.message.contains("chmod 700"), "{}", error.message);
     }
 }

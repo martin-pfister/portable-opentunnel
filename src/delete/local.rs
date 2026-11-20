@@ -11,8 +11,8 @@ use std::io;
 use std::path::Path;
 
 use crate::error::{AppError, AppResult};
-use crate::layout;
 use crate::state::StateLock;
+use crate::state::layout;
 
 /// Outcome of a local deletion.
 #[derive(Debug)]
@@ -23,6 +23,9 @@ pub struct LocalRemoval {
     pub root_removed: bool,
     /// Entries left behind because they are not ours.
     pub preserved: Vec<String>,
+    /// Why the emptied root could not be removed. Nothing owned is left, so
+    /// a `delete` retry cannot help.
+    pub root_error: Option<String>,
 }
 
 impl LocalRemoval {
@@ -46,28 +49,7 @@ impl LocalRemoval {
     }
 }
 
-/// The recovery command printed when a deletion could not complete.
-pub fn recovery_command(root: &std::path::Path) -> String {
-    format!(
-        "portable-opentunnel delete --dir {}",
-        shell_quote(&root.display().to_string())
-    )
-}
-
-/// Quotes a path for a POSIX shell when it needs quoting.
-pub fn shell_quote(value: &str) -> String {
-    let plain = !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@' | '+')
-        });
-    if plain {
-        value.to_owned()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
-fn remove_entry(path: &std::path::Path, failures: &mut Vec<String>) {
+fn remove_entry(path: &Path, failures: &mut Vec<String>) {
     if let Err(error) = unlink(path)
         && error.kind() != io::ErrorKind::NotFound
     {
@@ -75,13 +57,9 @@ fn remove_entry(path: &std::path::Path, failures: &mut Vec<String>) {
     }
 }
 
-/// The single deletion primitive, so a test can inject a deterministic failure.
-///
-/// Permission-based injection (`chmod 0500` on the parent) is not usable: a
-/// container or a `cargo test` run as root ignores the mode bits and the unlink
-/// succeeds, which would silently turn the ownership-preservation test into a
-/// test of nothing.
-fn unlink(path: &std::path::Path) -> io::Result<()> {
+/// The single deletion primitive, so a test can inject a failure. Permission
+/// bits cannot do that reliably: root, as in a CI container, ignores them.
+fn unlink(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if inject_unlink_failure(path) {
         return Err(io::Error::new(
@@ -94,7 +72,7 @@ fn unlink(path: &std::path::Path) -> io::Result<()> {
 
 /// Test-only seam: fails unlinks of paths whose name matches the armed entry.
 #[cfg(test)]
-fn inject_unlink_failure(path: &std::path::Path) -> bool {
+fn inject_unlink_failure(path: &Path) -> bool {
     let armed = INJECTED_UNLINK.with(|slot| slot.borrow().clone());
     armed.is_some_and(|name| path.file_name().is_some_and(|file| file == name.as_str()))
 }
@@ -130,11 +108,7 @@ impl Drop for InjectedUnlinkFailure {
 /// A non-empty directory is *retained*, not a failure: it can only hold entries
 /// this program does not own, and those are reported instead. Real I/O errors
 /// are still failures.
-fn remove_dir_if_present(
-    path: &std::path::Path,
-    failed: &mut Vec<String>,
-    retained: &mut Vec<String>,
-) {
+fn remove_dir_if_present(path: &Path, failed: &mut Vec<String>, retained: &mut Vec<String>) {
     match fs::remove_dir(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -149,7 +123,7 @@ fn remove_dir_if_present(
 ///
 /// Callers must have validated the lock and, for an ephemeral or explicit
 /// delete, completed any remote deletion first.
-pub fn remove_local(lock: &mut StateLock) -> AppResult<LocalRemoval> {
+pub fn remove(lock: &mut StateLock) -> AppResult<LocalRemoval> {
     lock.validate()?;
     let root = lock.root().to_path_buf();
     let mut failures = Vec::new();
@@ -222,16 +196,18 @@ pub fn remove_local(lock: &mut StateLock) -> AppResult<LocalRemoval> {
 
     // 4. Non-recursive root removal: fails harmlessly if preserved entries or
     //    a fresh concurrent run are there.
+    let mut root_error = None;
     let root_removed = if failures.is_empty() {
         match fs::remove_dir(&root) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => false,
             Err(error) => {
-                return Err(AppError::io(format!(
-                    "removing the empty state directory {} after removing its state",
+                root_error = Some(format!(
+                    "removing the empty state directory {} after removing its state: {error}",
                     root.display()
-                ))(error));
+                ));
+                false
             }
         }
     } else {
@@ -244,6 +220,7 @@ pub fn remove_local(lock: &mut StateLock) -> AppResult<LocalRemoval> {
         failures,
         root_removed,
         preserved,
+        root_error,
     })
 }
 
@@ -318,7 +295,7 @@ mod tests {
     use crate::state::{self, DEFAULT_API, Mode, WrapperMeta, write_wrapper};
     use crate::test_support::TempDir;
 
-    fn populated(root: &std::path::Path) {
+    fn populated(root: &Path) {
         state::create_private_dir(root).unwrap();
         let lock = StateLock::acquire(root, true).unwrap();
         write_wrapper(
@@ -340,7 +317,7 @@ mod tests {
         let root = temp.path().join("state");
         populated(&root);
         let mut lock = StateLock::acquire(&root, false).unwrap();
-        let removal = remove_local(&mut lock).unwrap();
+        let removal = remove(&mut lock).unwrap();
         assert!(removal.failures.is_empty(), "{removal:?}");
         assert!(removal.root_removed, "{removal:?}");
         assert!(!root.exists());
@@ -353,7 +330,7 @@ mod tests {
         populated(&root);
         fs::write(root.join("notes.txt"), b"mine").unwrap();
         let mut lock = StateLock::acquire(&root, false).unwrap();
-        let removal = remove_local(&mut lock).unwrap();
+        let removal = remove(&mut lock).unwrap();
         assert!(removal.failures.is_empty(), "{removal:?}");
         assert!(!removal.root_removed);
         assert!(root.join("notes.txt").exists());
@@ -362,9 +339,8 @@ mod tests {
         assert!(removal.describe().contains("does not own"));
     }
 
-    /// The regression for recursive `Storage::remove`: an unrelated file inside
-    /// `sdk/default` (or `sdk/`) must survive a deletion that otherwise
-    /// succeeds, and the report must say the directory was retained.
+    /// Unlike the SDK's recursive `Storage::remove`, unrelated files inside
+    /// `sdk/default` and `sdk/` survive, and the report says so.
     #[test]
     fn preserves_unrelated_entries_inside_the_sdk_directories() {
         let temp = TempDir::new();
@@ -376,7 +352,7 @@ mod tests {
         fs::write(sdk.join("scratch.log"), b"keep me too").unwrap();
 
         let mut lock = StateLock::acquire(&root, false).unwrap();
-        let removal = remove_local(&mut lock).unwrap();
+        let removal = remove(&mut lock).unwrap();
 
         // Retaining unrelated entries is not an operational failure.
         assert!(removal.failures.is_empty(), "{removal:?}");
@@ -410,19 +386,14 @@ mod tests {
         fs::write(profile.join("token.tmp-42"), b"partial").unwrap();
         fs::write(root.join("wrapper.json.tmp-42-abcdef"), b"{}").unwrap();
         let mut lock = StateLock::acquire(&root, false).unwrap();
-        let removal = remove_local(&mut lock).unwrap();
+        let removal = remove(&mut lock).unwrap();
         assert!(removal.root_removed, "{removal:?}");
         assert!(!root.exists());
     }
 
-    /// The recovery gap: when removing an owned entry *fails*, the wrapper must
-    /// survive. Removing it would leave SDK files with no ownership record,
-    /// which the classifier can only call corrupt — a state the printed
-    /// `delete` retry could never repair.
-    ///
-    /// The failure is injected at the deletion primitive rather than produced
-    /// with `chmod 0500`: root ignores the mode bits, so a permission-based
-    /// version of this test silently asserts nothing in a container.
+    /// When an owned entry cannot be removed, the wrapper and lock must
+    /// survive, or the printed `delete` retry would find SDK files without an
+    /// ownership record and refuse them as corrupt.
     #[test]
     fn keeps_the_wrapper_when_an_owned_file_cannot_be_removed() {
         let temp = TempDir::new();
@@ -432,7 +403,7 @@ mod tests {
         let mut lock = StateLock::acquire(&root, false).unwrap();
         let removal = {
             let _injected = InjectedUnlinkFailure::arm(layout::TOKEN);
-            remove_local(&mut lock).unwrap()
+            remove(&mut lock).unwrap()
         };
 
         assert!(
@@ -465,8 +436,6 @@ mod tests {
         );
     }
 
-    /// Once the injected failure is gone, the very same directory deletes
-    /// cleanly: the recorded failure is the only thing that blocked it.
     #[test]
     fn a_retry_after_the_failure_completes_the_deletion() {
         let temp = TempDir::new();
@@ -476,19 +445,16 @@ mod tests {
         let mut lock = StateLock::acquire(&root, false).unwrap();
         {
             let _injected = InjectedUnlinkFailure::arm(layout::TOKEN);
-            let failed = remove_local(&mut lock).unwrap();
+            let failed = remove(&mut lock).unwrap();
             assert!(!failed.failures.is_empty(), "{failed:?}");
         }
         lock.validate().unwrap();
-        let removal = remove_local(&mut lock).unwrap();
+        let removal = remove(&mut lock).unwrap();
         assert!(removal.failures.is_empty(), "{removal:?}");
         assert!(removal.root_removed, "{removal:?}");
         assert!(!root.exists());
     }
 
-    /// Unknown files are retained but are not a failure: the owned entries are
-    /// gone, so removing the wrapper is correct and the leftovers are simply
-    /// not ours.
     #[test]
     fn an_unknown_file_inside_the_profile_does_not_block_wrapper_removal() {
         let temp = TempDir::new();
@@ -498,7 +464,7 @@ mod tests {
         fs::write(profile.join("my-notes.txt"), b"keep me").unwrap();
 
         let mut lock = StateLock::acquire(&root, false).unwrap();
-        let removal = remove_local(&mut lock).unwrap();
+        let removal = remove(&mut lock).unwrap();
 
         assert!(removal.failures.is_empty(), "{removal:?}");
         assert_eq!(fs::read(profile.join("my-notes.txt")).unwrap(), b"keep me");
@@ -515,7 +481,7 @@ mod tests {
         populated(&root);
         let mut lock = StateLock::acquire(&root, false).unwrap();
         fs::remove_file(root.join(layout::LOCK_FILE)).unwrap();
-        let error = remove_local(&mut lock).unwrap_err();
+        let error = remove(&mut lock).unwrap_err();
         assert!(error.message.contains("lock"), "{}", error.message);
     }
 
@@ -556,7 +522,7 @@ mod tests {
                 state::Classification::Corrupt { .. }
             ));
             let mut lock = StateLock::acquire(&root, true).unwrap();
-            let error = remove_local(&mut lock).unwrap_err();
+            let error = remove(&mut lock).unwrap_err();
             assert!(
                 error.message.contains(&link.display().to_string()),
                 "{error}"
@@ -564,12 +530,5 @@ mod tests {
             assert_eq!(fs::read(&token).unwrap(), b"keep me");
             assert!(root.join(layout::WRAPPER_FILE).exists());
         }
-    }
-
-    #[test]
-    fn shell_quoting_handles_spaces_and_quotes() {
-        assert_eq!(shell_quote("/tmp/a-b"), "/tmp/a-b");
-        assert_eq!(shell_quote("/tmp/a b"), "'/tmp/a b'");
-        assert_eq!(shell_quote("/tmp/a'b"), r#"'/tmp/a'\''b'"#);
     }
 }

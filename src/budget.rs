@@ -9,6 +9,19 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
+/// Stands in for a timeout too large to add to the current time; it is also
+/// what tokio itself uses as "never".
+const FAR_FUTURE: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
+/// The instant `timeout` from now. A timeout too large to represent means
+/// "effectively never", not "already expired".
+pub fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .or_else(|| now.checked_add(FAR_FUTURE))
+        .unwrap_or(now)
+}
+
 /// A deadline that starts on first use and never moves again.
 #[derive(Debug)]
 pub struct Budget {
@@ -32,9 +45,7 @@ impl Budget {
         match self.deadline.get() {
             Some(deadline) => deadline,
             None => {
-                let armed = Instant::now()
-                    .checked_add(self.timeout)
-                    .unwrap_or_else(Instant::now);
+                let armed = deadline_after(self.timeout);
                 self.deadline.set(Some(armed));
                 armed
             }
@@ -83,5 +94,12 @@ mod tests {
     fn a_zero_timeout_is_immediately_expired() {
         let budget = Budget::new(Duration::ZERO);
         assert!(budget.expired());
+    }
+
+    #[test]
+    fn an_unrepresentable_timeout_never_expires() {
+        let budget = Budget::new(Duration::from_secs(u64::MAX));
+        assert!(budget.remaining() > Duration::from_secs(365 * 24 * 60 * 60));
+        assert!(!budget.expired());
     }
 }

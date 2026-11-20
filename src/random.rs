@@ -1,4 +1,4 @@
-//! Random tokens, read from the OS.
+//! Random names, read from the OS.
 //!
 //! `/dev/urandom` is the only source: routes and directory names must not be
 //! guessable, and no extra dependency is needed for a few dozen bytes.
@@ -7,27 +7,31 @@ use std::io::Read;
 
 const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
-/// Fills `buffer` from the kernel CSPRNG, panicking only if the OS cannot
-/// provide randomness at all (in which case no secure name can be chosen).
-fn fill(buffer: &mut [u8]) {
-    let mut file =
-        std::fs::File::open("/dev/urandom").expect("the kernel random device must be available");
-    file.read_exact(buffer)
-        .expect("reading from the kernel random device");
-}
-
-fn token(length: usize) -> String {
-    let mut bytes = vec![0u8; length];
-    fill(&mut bytes);
-    bytes
-        .iter()
-        .map(|byte| ALPHABET[*byte as usize % ALPHABET.len()] as char)
-        .collect()
-}
+/// Bytes at or above this are rejected, so every symbol is equally likely.
+const UNBIASED_LIMIT: u8 = (256 / ALPHABET.len() * ALPHABET.len()) as u8;
 
 /// A random lowercase-alphanumeric string.
+///
+/// Panics only if the kernel cannot provide randomness at all, in which case no
+/// unguessable name can be chosen.
 pub fn alphanumeric(length: usize) -> String {
-    token(length)
+    let mut source =
+        std::fs::File::open("/dev/urandom").expect("the kernel random device must be available");
+    let mut value = String::with_capacity(length);
+    let mut buffer = [0u8; 64];
+    while value.len() < length {
+        source
+            .read_exact(&mut buffer)
+            .expect("reading from the kernel random device");
+        value.extend(
+            buffer
+                .iter()
+                .filter(|&&byte| byte < UNBIASED_LIMIT)
+                .map(|&byte| ALPHABET[usize::from(byte) % ALPHABET.len()] as char)
+                .take(length - value.len()),
+        );
+    }
+    value
 }
 
 #[cfg(test)]
@@ -35,19 +39,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tokens_have_the_requested_shape() {
-        let value = alphanumeric(12);
-        assert_eq!(value.len(), 12);
-        assert!(
-            value
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        );
+    fn values_have_the_requested_shape() {
+        for length in [0, 1, 12, 100] {
+            let value = alphanumeric(length);
+            assert_eq!(value.len(), length);
+            assert!(
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            );
+        }
     }
 
     #[test]
-    fn tokens_differ() {
+    fn values_differ() {
         let values: std::collections::HashSet<String> = (0..64).map(|_| alphanumeric(16)).collect();
-        assert_eq!(values.len(), 64, "tokens must not repeat");
+        assert_eq!(values.len(), 64, "values must not repeat");
     }
 }
