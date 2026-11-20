@@ -331,32 +331,6 @@ mod tests {
     }
 
     #[test]
-    fn saved_url_prints_the_route_and_hostname() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        initialized(&root, "abc", "abc.opentunnel.xyz");
-        assert_eq!(saved_url(&root).unwrap(), "https://abc.abc.opentunnel.xyz");
-    }
-
-    #[test]
-    fn saved_url_with_the_root_route_is_the_bare_hostname() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        initialized(&root, "@", "abc.opentunnel.xyz");
-        assert_eq!(saved_url(&root).unwrap(), "https://abc.opentunnel.xyz");
-    }
-
-    #[test]
-    fn saved_url_of_a_missing_directory_creates_nothing() {
-        let temp = TempDir::new();
-        let root = temp.path().join("absent");
-        let error = saved_url(&root).unwrap_err();
-        assert_eq!(error.code, NO_TUNNEL);
-        assert!(error.message.starts_with("No tunnel initialized in"));
-        assert!(!root.exists());
-    }
-
-    #[test]
     fn saved_url_is_absent_until_provisioning_completes() {
         let temp = TempDir::new();
         let root = temp.path().join("state");

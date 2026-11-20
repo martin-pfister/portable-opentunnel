@@ -11,7 +11,6 @@ mod fake_api;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use fake_api::FakeApi;
 
@@ -238,16 +237,46 @@ fn an_unknown_tunnel_needs_no_valid_token_to_404() {
 }
 
 #[test]
+fn a_delete_needs_the_tunnel_token() {
+    let api = FakeApi::start_in_memory(None);
+    let rt = runtime();
+    let base = api.api_url();
+    rt.block_on(async {
+        let http = http();
+        let created: serde_json::Value = http
+            .post(format!("{base}/api/tunnel"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = created["tunnel"]["id"].as_str().unwrap().to_owned();
+        let response = http
+            .delete(format!("{base}/api/tunnel/{id}"))
+            .bearer_auth("wrong-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    });
+    assert_eq!(api.deletes(), 0);
+    assert!(!api.all_deleted());
+}
+
+#[test]
 fn backend_answers_a_plain_http_request() {
     let counter = Arc::new(AtomicUsize::new(0));
     let rt = runtime();
-    let address = rt.block_on(fake_api::start_backend(
-        "hello from the backend",
-        Arc::clone(&counter),
-    ));
-
+    let requests = Arc::clone(&counter);
     let body = rt.block_on(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(fake_api::serve_backend(listener, requests));
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream
             .write_all(b"GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n")
@@ -259,7 +288,7 @@ fn backend_answers_a_plain_http_request() {
     });
 
     assert!(body.contains("200 OK"), "{body}");
-    assert!(body.contains("hello from the backend"), "{body}");
+    assert!(body.contains(fake_api::BACKEND_BODY), "{body}");
     assert_eq!(counter.load(Ordering::SeqCst), 1, "one backend request");
 }
 
@@ -287,5 +316,4 @@ fn the_fixture_stays_within_loopback() {
         "the fixture must never bind a routable address: {}",
         api.api_url()
     );
-    assert!(Duration::from_secs(1) < Duration::from_secs(20));
 }

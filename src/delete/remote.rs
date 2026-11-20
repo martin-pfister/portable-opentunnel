@@ -171,22 +171,40 @@ mod tests {
     }
 
     #[test]
-    fn local_files_are_never_removed() {
+    fn a_failed_request_leaves_every_local_file() {
         let temp = crate::test_support::TempDir::new();
         let root = temp.path().join("state");
         crate::state::create_private_dir(&root).unwrap();
         let profile = layout::profile_dir(&root);
         std::fs::create_dir_all(&profile).unwrap();
-        for name in [layout::TOKEN, layout::TUNNEL] {
+        let files = [
+            layout::TOKEN,
+            layout::PRIVATE_KEY,
+            layout::CERTIFICATE,
+            layout::CHAIN,
+        ];
+        for name in files {
             std::fs::write(profile.join(name), b"secret").unwrap();
         }
-        let _ = delete_saved_identity(Request {
+        std::fs::write(
+            profile.join(layout::TUNNEL),
+            br#"{"id":"abc","hostname":"abc.opentunnel.xyz","certificateExpiry":"2099-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+
+        let error = delete_saved_identity(Request {
             api: "http://127.0.0.1:1",
             state_root: &root,
             ca_cert: None,
-            deadline: Instant::now() + Duration::from_millis(20),
-        });
-        assert!(profile.join(layout::TOKEN).exists());
-        assert!(profile.join(layout::TUNNEL).exists());
+            deadline: Instant::now() + Duration::from_secs(5),
+        })
+        .unwrap_err();
+        assert!(
+            error.message.contains("deleting the tunnel registration"),
+            "the request must have been attempted: {error}"
+        );
+        for name in files.into_iter().chain([layout::TUNNEL]) {
+            assert!(profile.join(name).exists(), "{name} was removed");
+        }
     }
 }

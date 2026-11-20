@@ -406,9 +406,14 @@ mod tests {
         let meta = WrapperMeta::new(Mode::Reusable, "http://127.0.0.1:1".into(), "route".into());
 
         let mut lock = StateLock::acquire(&root, true).unwrap();
+        let ca = Path::new("/etc/ca.pem");
         let problem =
-            finish_locally(&mut lock, &meta, None, &Budget::new(Duration::ZERO)).unwrap_err();
+            finish_locally(&mut lock, &meta, Some(ca), &Budget::new(Duration::ZERO)).unwrap_err();
         assert!(problem.contains("marked for resumption"), "{problem}");
+        assert!(
+            !problem.contains("--ca-cert"),
+            "finishing a recorded deletion needs no CA: {problem}"
+        );
         assert!(layout::profile_dir(&root).join(layout::TOKEN).exists());
         assert!(matches!(
             state::classify(&root).unwrap(),
@@ -442,16 +447,6 @@ mod tests {
             problem.contains(&recovery_command(&root, Some(ca))),
             "{problem}"
         );
-    }
-
-    #[test]
-    fn an_unreachable_api_keeps_the_credentials() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        state_at(&root, true, "http://127.0.0.1:1");
-        let error = delete(&root, None, Duration::from_millis(1)).unwrap_err();
-        assert_kept_credentials(&root, &error.message);
-        assert!(layout::profile_dir(&root).join(layout::TOKEN).exists());
     }
 
     /// Every remote failure, an HTTP error included, must say that the

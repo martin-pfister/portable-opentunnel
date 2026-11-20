@@ -20,13 +20,13 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fake_api::FakeApi;
+use fake_api::{BACKEND_BODY, FakeApi, serve_backend};
 use scratch::{Scratch, binary};
 
 impl Scratch {
@@ -63,12 +63,12 @@ const MARKER_ENV: &str = "PORTABLE_OPENTUNNEL_TEST_BINARY_USED";
 /// The context is the running test's name, taken from the thread name libtest
 /// assigns, so the marker proves *which* scenarios exercised the binary without
 /// every call site having to pass a label.
-fn record_exercise(fallback: &str) {
+fn record_exercise() {
     let Some(path) = std::env::var_os(MARKER_ENV).filter(|value| !value.is_empty()) else {
         return;
     };
     let thread = std::thread::current();
-    let context = thread.name().unwrap_or(fallback);
+    let context = thread.name().unwrap_or("lifecycle");
     let line = format!(
         "{}\t{}\t{}\n",
         binary().display(),
@@ -108,47 +108,17 @@ struct Process {
 }
 
 impl Process {
-    /// Spawns the executable with a cleared environment.
-    ///
-    /// `env_clear` means no `*_PROXY`, `OPENTUNNEL_CA_CERT`, `SSL_CERT_FILE`,
-    /// or `SSL_CERT_DIR` leaks in from the developer's shell.
+    /// Spawns the executable with [`Scratch::command`]'s cleared environment.
     fn spawn(scratch: &Scratch, args: &[&str], extra_env: &[(&str, &str)]) -> Self {
-        Self::spawn_with_context(scratch, args, extra_env, "lifecycle")
-    }
-
-    /// As [`Process::spawn`], but records a specific context in the CI marker.
-    fn spawn_with_context(
-        scratch: &Scratch,
-        args: &[&str],
-        extra_env: &[(&str, &str)],
-        context: &str,
-    ) -> Self {
-        let home = scratch.home();
-        let tmp = scratch.tmp();
-        let cwd = scratch.cwd();
-
-        let mut command = Command::new(binary());
-        command
-            .args(args)
-            .current_dir(&cwd)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &home)
-            .env("TMPDIR", &tmp)
-            .env("XDG_DATA_HOME", scratch.path("xdg-data"))
-            .env("XDG_CONFIG_HOME", scratch.path("xdg-config"))
-            .env("XDG_STATE_HOME", scratch.path("xdg-state"))
-            .env("XDG_RUNTIME_DIR", scratch.path("xdg-runtime"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut command = scratch.command(args);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         for (name, value) in extra_env {
             command.env(name, value);
         }
 
         let mut child = command.spawn().expect("spawning the executable");
         // Only a real launch counts as exercising the binary.
-        record_exercise(context);
+        record_exercise();
 
         let stdout = child.stdout.take().expect("the child's stdout");
         let (sender, lines) = mpsc::channel();
@@ -361,10 +331,8 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// The body the loopback backend answers with.
-const BACKEND_BODY: &str = "hello-from-backend";
-
-/// A loopback HTTP backend that answers `200` with [`BACKEND_BODY`].
+/// A loopback HTTP backend that answers `200` with
+/// [`fake_api::BACKEND_BODY`].
 ///
 /// Binds `127.0.0.1` always and, when the kernel provides IPv6 loopback, also
 /// `::1` on the *same* port. The two counters are kept apart so a test can prove
@@ -476,43 +444,9 @@ impl Backend {
     }
 }
 
-/// Accepts connections until the listener is dropped, answering one HTTP
-/// request per connection and counting it.
-async fn serve_backend(listener: tokio::net::TcpListener, requests: Arc<AtomicUsize>) {
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            return;
-        };
-        let requests = Arc::clone(&requests);
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buffer = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                match stream.read(&mut chunk).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                }
-            }
-            requests.fetch_add(1, Ordering::SeqCst);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{BACKEND_BODY}",
-                BACKEND_BODY.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.flush().await;
-        });
-    }
-}
-
 /// Starts the fake API and a loopback backend for one test.
 fn fixture(scratch: &Scratch) -> (FakeApi, Backend) {
     fixture_with(scratch, Backend::start())
-}
-
-/// The same, with a backend that also listens on `::1`.
-fn fixture_dual(scratch: &Scratch) -> (FakeApi, Backend) {
-    fixture_with(scratch, Backend::start_dual())
 }
 
 fn fixture_with(scratch: &Scratch, backend: Backend) -> (FakeApi, Backend) {
@@ -521,10 +455,6 @@ fn fixture_with(scratch: &Scratch, backend: Backend) -> (FakeApi, Backend) {
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], backend.port))),
     );
     (api, backend)
-}
-
-fn body_dir(scratch: &Scratch) -> PathBuf {
-    scratch.state()
 }
 
 fn read(path: &Path) -> String {
@@ -545,13 +475,18 @@ fn profile(state: &Path) -> PathBuf {
     state.join("sdk").join("default")
 }
 
-/// Runs `init` and returns its URL. Panics with the child's stderr on failure.
-fn init(scratch: &Scratch, api: &FakeApi, state: &Path, extra: &[&str]) -> String {
+/// Spawns `init` without waiting for it.
+fn spawn_init(scratch: &Scratch, api: &FakeApi, state: &Path, extra: &[&str]) -> Process {
     let mut args = vec!["init", "--dir", state.to_str().unwrap(), "--api"];
     let api_url = api.api_url();
     args.push(&api_url);
     args.extend_from_slice(extra);
-    let mut process = Process::spawn_with_context(scratch, &args, &[], "init");
+    Process::spawn(scratch, &args, &[])
+}
+
+/// Runs `init` and returns its URL. Panics with the child's stderr on failure.
+fn init(scratch: &Scratch, api: &FakeApi, state: &Path, extra: &[&str]) -> String {
+    let mut process = spawn_init(scratch, api, state, extra);
     process
         .expect_code(0, Duration::from_secs(40), "init")
         .unwrap_or_else(|error| panic!("{error}"));
@@ -626,49 +561,12 @@ fn wait_until(
 fn init_never_attaches_and_keeps_one_stable_url() {
     let scratch = Scratch::new();
     let (api, _backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
-    let mut process = Process::spawn(
-        &scratch,
-        &[
-            "init",
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "20",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
-    );
-    process
-        .expect_code(0, Duration::from_secs(30), "first init")
-        .expect("first init should succeed");
-    let first = process.wait_line("https://", Duration::from_secs(5));
-
+    let first = init(&scratch, &api, &state, &[]);
     // A second init must reuse the identity and the route.
-    let mut again = Process::spawn(
-        &scratch,
-        &[
-            "init",
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "20",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
-    );
-    again
-        .expect_code(0, Duration::from_secs(30), "second init")
-        .expect("second init should be idempotent");
-    let second = again.wait_line("https://", Duration::from_secs(5));
-
+    let second = init(&scratch, &api, &state, &[]);
+    assert_eq!(first, second, "the URL must stay stable");
     assert_eq!(
         api.creates(),
         1,
@@ -684,12 +582,10 @@ fn init_never_attaches_and_keeps_one_stable_url() {
     let mut url = Process::spawn(&scratch, &["url", "--dir", state.to_str().unwrap()], &[]);
     url.expect_code(0, Duration::from_secs(10), "url after init")
         .expect("url should read the saved state");
-    let printed = url.wait_line("https://", Duration::from_secs(5));
-
-    if let (Ok(first), Ok(second), Ok(printed)) = (first, second, printed) {
-        assert_eq!(first.trim(), printed.trim(), "url must print the saved URL");
-        assert_eq!(second.trim(), printed.trim(), "the URL must stay stable");
-    }
+    let printed = url
+        .wait_line("https://", Duration::from_secs(5))
+        .expect("url must print the saved URL");
+    assert_eq!(first, printed.trim(), "url must print the saved URL");
     assert_eq!(api.deletes(), 0, "init must not delete anything");
 }
 
@@ -699,26 +595,10 @@ fn init_never_attaches_and_keeps_one_stable_url() {
 fn persistent_forward_serves_traffic_then_keeps_identity_on_sigterm() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
-    let target = backend.target();
+    let state = scratch.state();
+    let timeouts = ["--startup-timeout", "30", "--shutdown-timeout", "10"];
 
-    let mut process = Process::spawn(
-        &scratch,
-        &[
-            "up",
-            &target,
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "30",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
-    );
-
+    let mut process = spawn_forward(&scratch, &api, &state, &backend.target(), &timeouts);
     let url = process
         .wait_line("https://", Duration::from_secs(40))
         .expect("the URL must be printed only after the bridge attached");
@@ -730,7 +610,7 @@ fn persistent_forward_serves_traffic_then_keeps_identity_on_sigterm() {
     // Prove the bytes actually came from the backend through the tunnel, rather
     // than merely that some TLS connection succeeded.
     assert!(
-        response.contains("hello-from-backend"),
+        response.contains(BACKEND_BODY),
         "the visitor did not receive the backend's body; got: {response:?}"
     );
     assert!(
@@ -757,22 +637,8 @@ fn persistent_forward_serves_traffic_then_keeps_identity_on_sigterm() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding a spare port");
         listener.local_addr().expect("local address").port()
     };
-    let mut restart = Process::spawn(
-        &scratch,
-        &[
-            "up",
-            &format!("127.0.0.1:{other_port}"),
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "30",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
-    );
+    let other_target = format!("127.0.0.1:{other_port}");
+    let mut restart = spawn_forward(&scratch, &api, &state, &other_target, &timeouts);
     let restarted = restart
         .wait_line("https://", Duration::from_secs(40))
         .expect("the restart must attach again");
@@ -835,25 +701,8 @@ fn ephemeral_exit_deletes_remotely_and_removes_local_state() {
 fn delete_removes_a_complete_identity_and_accepts_404() {
     let scratch = Scratch::new();
     let (api, _backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
-
-    let mut init = Process::spawn(
-        &scratch,
-        &[
-            "init",
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "20",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
-    );
-    init.expect_code(0, Duration::from_secs(30), "init before delete")
-        .expect("init should succeed");
+    let state = scratch.state();
+    init(&scratch, &api, &state, &[]);
 
     let mut delete = Process::spawn(&scratch, &["delete", "--dir", state.to_str().unwrap()], &[]);
     delete
@@ -865,23 +714,7 @@ fn delete_removes_a_complete_identity_and_accepts_404() {
     // A second identity whose registration the server no longer knows: the
     // fixture answers 404 on DELETE, which must count as success.
     let second = scratch.path("state404");
-    let mut init = Process::spawn(
-        &scratch,
-        &[
-            "init",
-            "--dir",
-            second.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "20",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
-    );
-    init.expect_code(0, Duration::from_secs(30), "init for 404 case")
-        .expect("init should succeed");
+    init(&scratch, &api, &second, &[]);
     api.change(|behaviour| behaviour.delete_status = Some(404));
 
     let mut delete = Process::spawn(
@@ -898,6 +731,108 @@ fn delete_removes_a_complete_identity_and_accepts_404() {
     );
 }
 
+/// A state directory only works with the service that created it: every
+/// command that contacts the API refuses a different `--api` before sending
+/// anything.
+#[test]
+fn a_different_api_origin_is_refused_by_every_network_command() {
+    let scratch = Scratch::new();
+    let (api, backend) = fixture(&scratch);
+    let state = scratch.state();
+    let url = init(&scratch, &api, &state, &[]);
+    let dir = state.to_str().unwrap();
+    let target = backend.target();
+    let target = target.as_str();
+    let other = "http://127.0.0.1:1";
+
+    for args in [
+        vec!["init", "--dir", dir, "--api", other],
+        vec!["up", target, "--dir", dir, "--api", other],
+        vec!["delete", "--dir", dir, "--api", other],
+    ] {
+        let mut process = Process::spawn(&scratch, &args, &[]);
+        process
+            .expect_code(1, Duration::from_secs(20), args[0])
+            .expect("a different origin must be refused");
+        assert!(
+            process.stderr().contains("was created for"),
+            "{}: {}",
+            args[0],
+            process.stderr()
+        );
+    }
+    assert_eq!(
+        (api.creates(), api.attaches(), api.delete_requests()),
+        (1, 0, 0)
+    );
+
+    let mut saved = Process::spawn(&scratch, &["url", "--dir", dir], &[]);
+    saved
+        .expect_code(0, Duration::from_secs(10), "url after refusals")
+        .expect("the refusals must leave the state intact");
+    assert_eq!(
+        saved
+            .wait_line("https://", Duration::from_secs(5))
+            .unwrap()
+            .trim(),
+        url
+    );
+}
+
+/// An equivalent spelling of the saved origin is the same service.
+#[test]
+fn an_equivalent_api_spelling_is_accepted() {
+    let scratch = Scratch::new();
+    let (api, _backend) = fixture(&scratch);
+    let state = scratch.state();
+    init(&scratch, &api, &state, &[]);
+
+    let spelling = format!("{}/", api.api_url().replacen("http", "HTTP", 1));
+    let mut delete = Process::spawn(
+        &scratch,
+        &[
+            "delete",
+            "--dir",
+            state.to_str().unwrap(),
+            "--api",
+            &spelling,
+        ],
+        &[],
+    );
+    delete
+        .expect_code(
+            0,
+            Duration::from_secs(25),
+            "delete with an equivalent origin",
+        )
+        .expect("an equivalent origin must be accepted");
+    assert_eq!(api.deletes(), 1);
+}
+
+/// A timeout too large to add to the clock means "no limit", not "expired".
+#[test]
+fn huge_timeouts_do_not_expire_at_once() {
+    let scratch = Scratch::new();
+    let (api, backend) = fixture(&scratch);
+    let state = scratch.state();
+    let huge = u64::MAX.to_string();
+
+    let mut process = spawn_forward(
+        &scratch,
+        &api,
+        &state,
+        &backend.target(),
+        &["--startup-timeout", &huge, "--shutdown-timeout", &huge],
+    );
+    process
+        .wait_line("https://", Duration::from_secs(40))
+        .expect("a huge startup timeout must not expire before attaching");
+    process.signal(libc::SIGTERM);
+    process
+        .expect_code(143, Duration::from_secs(20), "shutdown with a huge budget")
+        .expect("SIGTERM must exit 143");
+}
+
 /// A pending-only identity is deleted through the pending path.
 ///
 /// The fixture never issues a certificate, so the run is interrupted after the
@@ -908,39 +843,21 @@ fn delete_removes_a_pending_only_identity() {
     let scratch = Scratch::new();
     let (api, _backend) = fixture(&scratch);
     api.change(|behaviour| behaviour.certificate_never_ready = true);
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
-    let mut process = Process::spawn(
+    let mut process = spawn_init(
         &scratch,
-        &[
-            "init",
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "120",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
+        &api,
+        &state,
+        &["--startup-timeout", "120", "--shutdown-timeout", "10"],
     );
-
-    let pending = state.join("sdk").join("default").join("pending.json");
-    let deadline = Instant::now() + Duration::from_secs(40);
-    while !pending.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the SDK never saved a pending identity.\nstderr: {}",
-            process.stderr()
-        );
-        assert!(
-            process.poll_exit().is_none(),
-            "the child exited before saving a pending identity.\nstderr: {}",
-            process.stderr()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let pending = profile(&state).join("pending.json");
+    wait_until(
+        &mut process,
+        Duration::from_secs(40),
+        "a saved pending identity",
+        || pending.exists(),
+    );
 
     process.signal(libc::SIGTERM);
     process
@@ -973,23 +890,14 @@ fn startup_timeout_and_signal_before_ready() {
     let scratch = Scratch::new();
     let (api, _backend) = fixture(&scratch);
     api.change(|behaviour| behaviour.certificate_never_ready = true);
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
     // 1. The startup deadline bounds a connection that never becomes ready.
-    let mut timeout = Process::spawn(
+    let mut timeout = spawn_init(
         &scratch,
-        &[
-            "init",
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "2",
-            "--shutdown-timeout",
-            "5",
-        ],
-        &[],
+        &api,
+        &state,
+        &["--startup-timeout", "2", "--shutdown-timeout", "5"],
     );
     timeout
         .expect_code(1, Duration::from_secs(30), "startup timeout")
@@ -1008,37 +916,20 @@ fn startup_timeout_and_signal_before_ready() {
     // -2). Wait for the count to grow past this baseline instead.
     let other = scratch.path("state2");
     let creates_before = api.creates();
-    let mut early = Process::spawn(
+    let mut early = spawn_init(
         &scratch,
-        &[
-            "init",
-            "--dir",
-            other.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "120",
-            "--shutdown-timeout",
-            "5",
-        ],
-        &[],
+        &api,
+        &other,
+        &["--startup-timeout", "120", "--shutdown-timeout", "5"],
     );
     // Wait for this child's own registration, which proves it is genuinely
     // inside provisioning rather than merely started.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while api.creates() <= creates_before {
-        assert!(
-            Instant::now() < deadline,
-            "the child never created a registration.\nstderr: {}",
-            early.stderr()
-        );
-        assert!(
-            early.poll_exit().is_none(),
-            "the child exited before being signalled.\nstderr: {}",
-            early.stderr()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        &mut early,
+        Duration::from_secs(20),
+        "this child's registration",
+        || api.creates() > creates_before,
+    );
     early.signal(libc::SIGINT);
     early
         .expect_code(130, Duration::from_secs(20), "SIGINT before readiness")
@@ -1051,26 +942,8 @@ fn startup_timeout_and_signal_before_ready() {
 fn failed_deletion_preserves_credentials_and_prints_recovery() {
     let scratch = Scratch::new();
     let (api, _backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
-
-    let mut init = Process::spawn(
-        &scratch,
-        &[
-            "init",
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "20",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
-    );
-    init.expect_code(0, Duration::from_secs(30), "init before failed delete")
-        .expect("init should succeed");
-
+    let state = scratch.state();
+    init(&scratch, &api, &state, &[]);
     api.change(|behaviour| behaviour.delete_status = Some(500));
 
     let mut delete = Process::spawn(&scratch, &["delete", "--dir", state.to_str().unwrap()], &[]);
@@ -1084,42 +957,87 @@ fn failed_deletion_preserves_credentials_and_prints_recovery() {
         "the failure must say the credentials were kept: {stderr}"
     );
     assert!(
-        stderr.contains("portable-opentunnel delete --dir"),
+        stderr.contains(&format!(
+            "portable-opentunnel delete --dir {}",
+            state.display()
+        )),
         "the failure must print the exact recovery command: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--ca-cert"),
+        "no CA was in use, so the retry must not name one: {stderr}"
     );
     assert!(
         state.join("wrapper.json").exists(),
         "wrapper metadata must survive a failed deletion"
     );
     assert!(
-        state.join("sdk").join("default").join("token").exists(),
+        profile(&state).join("token").exists(),
         "the token must survive a failed deletion"
+    );
+    assert!(
+        !stderr.contains(&read(&profile(&state).join("token")).trim().to_owned()),
+        "the token must never be printed: {stderr}"
     );
 }
 
-/// SIGINT exits 130, and a second signal forces a prompt exit without pretending
-/// to have cleaned up.
+/// The retry command after a failed deletion over HTTPS names the CA it
+/// needs, as an absolute path even when `--ca-cert` was relative.
 #[test]
-fn sigint_exits_130_and_a_second_signal_forces_exit() {
+fn failed_deletion_over_https_prints_a_retry_with_the_ca() {
     let scratch = Scratch::new();
-    let (api, backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
+    let api = FakeApi::start_https(scratch.root(), None);
+    let state = scratch.state();
+    let ca = ca_args(&api);
+    init(&scratch, &api, &state, &[&ca[0], &ca[1]]);
+    api.change(|behaviour| behaviour.delete_status = Some(500));
 
-    let mut process = Process::spawn(
+    let relative = Path::new("..").join(api.ca_path().file_name().unwrap());
+    let mut delete = Process::spawn(
         &scratch,
         &[
-            "up",
-            backend.target().as_str(),
+            "delete",
             "--dir",
             state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "30",
-            "--shutdown-timeout",
-            "15",
+            "--ca-cert",
+            relative.to_str().unwrap(),
         ],
         &[],
+    );
+    delete
+        .expect_code(
+            1,
+            Duration::from_secs(25),
+            "HTTPS delete against a failing API",
+        )
+        .expect("a failed deletion must exit 1");
+
+    let stderr = delete.stderr();
+    assert_eq!(api.delete_requests(), 1, "the DELETE must reach the API");
+    let expected = format!(
+        "portable-opentunnel delete --dir {} --ca-cert {}",
+        state.display(),
+        scratch.cwd().join(&relative).display()
+    );
+    assert!(
+        stderr.contains(&expected),
+        "expected {expected:?} in: {stderr}"
+    );
+}
+
+/// SIGINT during forwarding exits 130.
+#[test]
+fn sigint_during_forwarding_exits_130() {
+    let scratch = Scratch::new();
+    let (api, backend) = fixture(&scratch);
+    let state = scratch.state();
+
+    let mut process = spawn_forward(
+        &scratch,
+        &api,
+        &state,
+        &backend.target(),
+        &["--startup-timeout", "30", "--shutdown-timeout", "15"],
     );
     process
         .wait_line("https://", Duration::from_secs(40))
@@ -1129,112 +1047,146 @@ fn sigint_exits_130_and_a_second_signal_forces_exit() {
     process
         .expect_code(130, Duration::from_secs(25), "SIGINT during forwarding")
         .expect("SIGINT must exit 130");
-
-    // A second signal, sent immediately after the first, must also terminate
-    // promptly rather than hanging in cleanup.
-    let other = scratch.path("state2");
-    let mut twice = Process::spawn(
-        &scratch,
-        &[
-            "up",
-            backend.target().as_str(),
-            "--dir",
-            other.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "30",
-            "--shutdown-timeout",
-            "30",
-        ],
-        &[],
-    );
-    twice
-        .wait_line("https://", Duration::from_secs(40))
-        .expect("the second tunnel must attach");
-    twice.signal(libc::SIGTERM);
-    twice.signal(libc::SIGTERM);
-    let status = twice
-        .wait_exit(Duration::from_secs(10))
-        .expect("a second signal must not hang the process");
-    assert!(
-        status.code().is_some() || status.signal().is_some(),
-        "the process must exit after a repeated signal"
-    );
 }
 
-/// A delayed certificate refresh that is still in flight during shutdown must
-/// not recreate credential files after a successful deletion.
-///
-/// The in-flight request is *observed* through the fixture's poll counter rather
-/// than assumed: the SDK issues one certificate GET during provisioning and then
-/// one immediately on attach, so a poll count above the provisioning baseline
-/// proves the refresh task has entered its delayed GET. Only then is the signal
-/// sent, which is the state the runtime teardown has to survive.
+/// A second signal cuts a slow cleanup short: the process exits at once,
+/// without claiming the registration or the local state were removed.
 #[test]
-fn delayed_refresh_cannot_recreate_deleted_state() {
+fn a_second_signal_abandons_a_slow_cleanup() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
-    // Hold every certificate GET in flight for longer than the shutdown budget.
-    api.change(|behaviour| behaviour.certificate_delay = Duration::from_secs(3));
+    api.change(|behaviour| behaviour.delete_delay = Duration::from_secs(60));
 
     let mut process = spawn_ephemeral(
         &scratch,
         &api,
         &backend.target(),
-        &["--startup-timeout", "30", "--shutdown-timeout", "15"],
+        &["--startup-timeout", "30", "--shutdown-timeout", "120"],
+    );
+    process
+        .wait_line("https://", Duration::from_secs(40))
+        .expect("the ephemeral tunnel must attach");
+    let state = scratch.ephemeral_state();
+
+    process.signal(libc::SIGTERM);
+    wait_until(
+        &mut process,
+        Duration::from_secs(20),
+        "the held DELETE",
+        || api.delete_requests() > 0,
+    );
+    process.signal(libc::SIGTERM);
+    process
+        .expect_code(143, Duration::from_secs(5), "second SIGTERM during cleanup")
+        .expect("a second signal must exit 143 at once");
+
+    assert_eq!(api.deletes(), 0, "the held DELETE was never answered");
+    assert!(
+        profile(&state).join("token").exists(),
+        "an abandoned cleanup must leave the credentials for a later delete"
+    );
+}
+
+/// A renewed certificate is saved while forwarding. This is what makes the
+/// next test meaningful: a refresh that outlived shutdown would write too.
+#[test]
+fn a_renewed_certificate_is_saved_while_forwarding() {
+    let scratch = Scratch::new();
+    let (api, backend) = fixture(&scratch);
+    let state = scratch.state();
+    init(&scratch, &api, &state, &[]);
+    let certificate = profile(&state).join("certificate.pem");
+    let issued = read(&certificate);
+    api.change(|behaviour| behaviour.renew_certificates = true);
+
+    let mut process = spawn_forward(
+        &scratch,
+        &api,
+        &state,
+        &backend.target(),
+        &["--startup-timeout", "30", "--shutdown-timeout", "10"],
+    );
+    process
+        .wait_line("https://", Duration::from_secs(40))
+        .expect("the tunnel must attach");
+    wait_until(
+        &mut process,
+        Duration::from_secs(20),
+        "the renewed certificate on disk",
+        || fs::read_to_string(&certificate).is_ok_and(|now| now != issued),
+    );
+
+    process.signal(libc::SIGTERM);
+    process
+        .expect_code(143, Duration::from_secs(20), "shutdown after renewal")
+        .expect("SIGTERM must exit 143");
+}
+
+/// A certificate refresh still in flight at shutdown never writes again.
+///
+/// The fixture holds the refresh GET for 3 s and answers it with a renewed
+/// certificate, which a live refresh task would save. The DELETE is held for
+/// 10 s, so that answer arrives while the process is alive and cleaning up,
+/// before local files are removed. The certificate on disk must not change.
+#[test]
+fn a_refresh_in_flight_at_shutdown_never_writes() {
+    let scratch = Scratch::new();
+    let (api, backend) = fixture(&scratch);
+    api.change(|behaviour| {
+        behaviour.certificate_delay = Duration::from_secs(3);
+        behaviour.renew_certificates = true;
+        behaviour.delete_delay = Duration::from_secs(10);
+    });
+
+    let mut process = spawn_ephemeral(
+        &scratch,
+        &api,
+        &backend.target(),
+        &["--startup-timeout", "30", "--shutdown-timeout", "30"],
     );
     process
         .wait_line("https://", Duration::from_secs(60))
         .expect("the ephemeral tunnel must attach");
-    let state = scratch.ephemeral_state();
-
-    // Wait until a certificate GET is *actually held* by the fixture. `polls()`
-    // only proves a request happened at some point; `active_refreshes()` proves
-    // one is inside the delay right now, which is the state a shutdown must
-    // survive.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while api.active_refreshes() == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "no certificate GET was ever in flight.\nstderr: {}",
-            process.stderr()
-        );
-        assert!(
-            process.poll_exit().is_none(),
-            "the child exited before a refresh was in flight.\nstderr: {}",
-            process.stderr()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let certificate = profile(&scratch.ephemeral_state()).join("certificate.pem");
+    wait_until(
+        &mut process,
+        Duration::from_secs(30),
+        "a held certificate refresh",
+        || api.active_refreshes() > 0,
+    );
+    let before = read(&certificate);
 
     process.signal(libc::SIGTERM);
-    process
-        .expect_code(
-            143,
-            Duration::from_secs(30),
-            "ephemeral shutdown with a held refresh",
-        )
-        .expect("shutdown must still exit 143");
+    wait_until(
+        &mut process,
+        Duration::from_secs(20),
+        "the held DELETE",
+        || api.delete_requests() > 0,
+    );
+    wait_until(
+        &mut process,
+        Duration::from_secs(10),
+        "the refresh answer",
+        || api.active_refreshes() == 0,
+    );
+    // Give a surviving refresh task time to save what it received.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        api.deletes(),
+        0,
+        "the DELETE was answered too early for this check to mean anything"
+    );
+    assert_eq!(
+        read(&certificate),
+        before,
+        "a refresh task kept running after shutdown began"
+    );
 
-    // The delayed GET resolves about 3 s after it was issued. Any task that
-    // escaped the forwarding runtime would write credentials in that window, so
-    // wait past it before asserting the state stayed gone.
-    let settle = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < settle {
-        if state.join("sdk").join("default").join("token").exists() || state.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        !state.join("sdk").join("default").join("token").exists(),
-        "credentials reappeared after deletion: a refresh task escaped the runtime"
-    );
-    assert!(
-        !state.exists(),
-        "the state directory was recreated after a successful deletion"
-    );
+    process
+        .expect_code(143, Duration::from_secs(20), "shutdown with a held refresh")
+        .expect("shutdown must still exit 143");
+    assert_eq!(api.deletes(), 1, "{}", process.stderr());
+    assert!(!certificate.exists(), "the local state must be removed");
 }
 
 /// Unrecognized files under the SDK profile are preserved, and the surrounding
@@ -1243,28 +1195,12 @@ fn delayed_refresh_cannot_recreate_deleted_state() {
 fn unknown_profile_files_are_preserved_on_successful_delete() {
     let scratch = Scratch::new();
     let (api, _backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
-    let mut init = Process::spawn(
-        &scratch,
-        &[
-            "init",
-            "--dir",
-            state.to_str().unwrap(),
-            "--api",
-            &api.api_url(),
-            "--startup-timeout",
-            "20",
-            "--shutdown-timeout",
-            "10",
-        ],
-        &[],
-    );
-    init.expect_code(0, Duration::from_secs(30), "init before preservation check")
-        .expect("init should succeed");
+    init(&scratch, &api, &state, &[]);
 
     // A file this program does not own, inside the SDK profile.
-    let profile = state.join("sdk").join("default");
+    let profile = profile(&state);
     let stranger = profile.join("notes.txt");
     fs::write(&stranger, b"keep me\n").expect("writing an unrelated file");
 
@@ -1412,16 +1348,16 @@ fn startup_deadline_spans_provisioning_and_attachment() {
     let (api, backend) = fixture(&scratch);
     api.change(|behaviour| {
         behaviour.create_delay = Duration::from_secs(3);
-        behaviour.attach_delay = Duration::from_secs(3);
+        behaviour.attach_delay = Duration::from_secs(4);
     });
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
     let mut process = spawn_forward(
         &scratch,
         &api,
         &state,
         &backend.target(),
-        &["--startup-timeout", "5", "--shutdown-timeout", "10"],
+        &["--startup-timeout", "6", "--shutdown-timeout", "10"],
     );
 
     process
@@ -1455,19 +1391,23 @@ fn https_and_wss_with_the_fixture_ca_forwards() {
         scratch.root(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], backend.port))),
     );
-    let state = body_dir(&scratch);
+    let state = scratch.state();
     let ca = ca_args(&api);
-    let ca_refs: Vec<&str> = ca.iter().map(String::as_str).collect();
 
-    let target = backend.target();
-    let mut args = vec!["up", target.as_str(), "--dir", state.to_str().unwrap()];
-    let api_url = api.api_url();
-    args.push("--api");
-    args.push(&api_url);
-    args.extend_from_slice(&ca_refs);
-    args.extend_from_slice(&["--startup-timeout", "40", "--shutdown-timeout", "10"]);
-
-    let mut process = Process::spawn(&scratch, &args, &[]);
+    let mut process = spawn_forward(
+        &scratch,
+        &api,
+        &state,
+        &backend.target(),
+        &[
+            &ca[0],
+            &ca[1],
+            "--startup-timeout",
+            "40",
+            "--shutdown-timeout",
+            "10",
+        ],
+    );
     process
         .wait_line("https://", Duration::from_secs(60))
         .unwrap_or_else(|error| panic!("{error}"));
@@ -1475,7 +1415,7 @@ fn https_and_wss_with_the_fixture_ca_forwards() {
     let response = block_on(api.wait_visitor_response(Duration::from_secs(25)))
         .expect("the visitor exchange over WSS must complete");
     assert!(
-        response.contains("hello-from-backend"),
+        response.contains(BACKEND_BODY),
         "the forwarded body must come from the backend; got {response:?}"
     );
     assert!(backend.requests() >= 1, "the backend must be reached");
@@ -1496,7 +1436,7 @@ fn https_without_the_ca_fails_within_the_startup_deadline() {
         scratch.root(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], backend.port))),
     );
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
     let mut process = spawn_forward(
         &scratch,
@@ -1515,6 +1455,12 @@ fn https_without_the_ca_fails_within_the_startup_deadline() {
         "the startup deadline must bound the retries"
     );
     // Nothing may be completed: no registration, no `tunnel.json`, no URL.
+    assert_eq!(
+        api.creates(),
+        0,
+        "no request may pass an untrusted handshake"
+    );
+    assert!(!process.stdout_has("https://"));
     assert!(
         !profile(&state).join("tunnel.json").exists(),
         "no identity may be completed when the CA is not trusted"
@@ -1530,7 +1476,7 @@ fn https_without_the_ca_fails_within_the_startup_deadline() {
 fn sigkill_persistent_state_reopens_with_the_same_url() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
     let mut first = spawn_forward(
         &scratch,
@@ -1611,7 +1557,7 @@ fn certificate_failure_exits_1_and_keeps_state() {
     api.change(|behaviour| {
         behaviour.certificate_failure = Some("the CA refused to issue".to_owned());
     });
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
     let mut process = spawn_forward(
         &scratch,
@@ -1645,7 +1591,7 @@ fn bad_token_attach_is_terminal_and_never_reports_ready() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
     // Provision normally, then make the bridge reject the attach.
-    let state = body_dir(&scratch);
+    let state = scratch.state();
     init(&scratch, &api, &state, &["--startup-timeout", "30"]);
     api.change(|behaviour| behaviour.attach_error = Some("bad_token".to_owned()));
 
@@ -1679,7 +1625,7 @@ fn relay_disconnect_reconnects_and_second_attach_forwards() {
     // Flipping a flag from the test would race the SDK's reconnect, because
     // `attaches` is counted before the handler snapshots the behaviour.
     api.change(|behaviour| behaviour.drop_first_attach_only = true);
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
     let mut process = spawn_forward(
         &scratch,
@@ -1715,7 +1661,7 @@ fn relay_disconnect_reconnects_and_second_attach_forwards() {
     let response = block_on(api.wait_visitor_response(Duration::from_secs(25)))
         .expect("the reconnected session must forward a visitor exchange");
     assert!(
-        response.contains("hello-from-backend"),
+        response.contains(BACKEND_BODY),
         "the reconnected tunnel must reach the backend; got {response:?}"
     );
     assert!(backend.requests() >= 1, "the backend must be reached");
@@ -1745,15 +1691,14 @@ fn relay_disconnect_reconnects_and_second_attach_forwards() {
 
 /// A `localhost` target reaches a backend that listens only on `127.0.0.1`.
 ///
-/// `localhost` resolves to `::1` first on many systems. Because this backend has
-/// no IPv6 listener, that first attempt is refused and the tunnel must retry the
-/// IPv4 address — so the test proves the fallthrough, not merely that a name
-/// resolved.
+/// Where `localhost` resolves to `::1` first, that attempt is refused because
+/// this backend has no IPv6 listener, so the test also covers falling through
+/// to IPv4. Where it resolves to IPv4 only, it covers plain name resolution.
 #[test]
 fn localhost_target_reaches_a_loopback_backend() {
     let scratch = Scratch::new();
     let (api, backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
+    let state = scratch.state();
 
     let mut process = spawn_forward(
         &scratch,
@@ -1796,18 +1741,19 @@ fn localhost_target_reaches_a_loopback_backend() {
 ///
 /// CI may point `PORTABLE_OPENTUNNEL_TEST_HOST` at a name it mapped to loopback
 /// (for example `--add-host portable-opentunnel-fixture:127.0.0.1`). Without the
-/// variable the test uses `localhost`, so it runs everywhere and never depends
-/// on external DNS.
+/// variable this would repeat the `localhost` test above, so it is skipped.
 #[test]
 fn configured_host_target_reaches_a_loopback_backend() {
-    let scratch = Scratch::new();
-    let (api, backend) = fixture(&scratch);
-    let state = body_dir(&scratch);
-
-    let host = std::env::var("PORTABLE_OPENTUNNEL_TEST_HOST")
+    let Some(host) = std::env::var("PORTABLE_OPENTUNNEL_TEST_HOST")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "localhost".to_owned());
+    else {
+        eprintln!("skipping: PORTABLE_OPENTUNNEL_TEST_HOST is not set");
+        return;
+    };
+    let scratch = Scratch::new();
+    let (api, backend) = fixture(&scratch);
+    let state = scratch.state();
     let target = format!("{host}:{}", backend.port);
 
     let mut process = spawn_forward(
@@ -1841,15 +1787,14 @@ fn configured_host_target_reaches_a_loopback_backend() {
 /// and it asserts that the request arrived over `::1` specifically.
 #[test]
 fn bracketed_ipv6_target_reaches_an_ipv6_backend() {
-    let scratch = Scratch::new();
-    let (api, backend) = fixture_dual(&scratch);
+    let backend = Backend::start_dual();
     if !backend.has_ipv6() {
-        // Nothing to prove without a second loopback address family, and
-        // building a tunnel only to skip would waste a registration.
         eprintln!("skipping bracketed_ipv6_target_reaches_an_ipv6_backend: no IPv6 loopback");
         return;
     }
-    let state = body_dir(&scratch);
+    let scratch = Scratch::new();
+    let (api, backend) = fixture_with(&scratch, backend);
+    let state = scratch.state();
 
     let mut process = spawn_forward(
         &scratch,

@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn recognized_residue_is_recovered() {
+    fn residue_in_the_root_and_the_profile_is_a_first_run() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
         create_private_dir(&root).unwrap();
@@ -556,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_files_inside_the_profile_are_preserved() {
+    fn unknown_files_inside_the_profile_leave_metadata_resumable() {
         let temp = TempDir::new();
         let root = temp.path().join("state");
         create_private_dir(&root).unwrap();

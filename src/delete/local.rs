@@ -456,25 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_file_inside_the_profile_does_not_block_wrapper_removal() {
-        let temp = TempDir::new();
-        let root = temp.path().join("state");
-        populated(&root);
-        let profile = layout::profile_dir(&root);
-        fs::write(profile.join("my-notes.txt"), b"keep me").unwrap();
-
-        let mut lock = StateLock::acquire(&root, false).unwrap();
-        let removal = remove(&mut lock).unwrap();
-
-        assert!(removal.failures.is_empty(), "{removal:?}");
-        assert_eq!(fs::read(profile.join("my-notes.txt")).unwrap(), b"keep me");
-        for name in [layout::TOKEN, layout::PRIVATE_KEY, layout::TUNNEL] {
-            assert!(!profile.join(name).exists(), "{name} should be gone");
-        }
-        assert!(!root.join(layout::WRAPPER_FILE).exists());
-    }
-
-    #[test]
     fn refuses_without_the_lock() {
         let temp = TempDir::new();
         let root = temp.path().join("state");

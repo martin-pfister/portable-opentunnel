@@ -1,5 +1,5 @@
 //! Helpers shared by unit tests: temporary directories with owner-only
-//! permissions, kept under the platform temporary directory.
+//! permissions, kept under `TMPDIR` (or `/tmp` when it is unset or empty).
 
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
@@ -12,7 +12,10 @@ pub struct TempDir {
 
 impl TempDir {
     pub fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let base = std::env::var_os("TMPDIR")
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let path = base.join(format!(
             "portable-opentunnel-test-{}-{}",
             std::process::id(),
             crate::random::alphanumeric(16)

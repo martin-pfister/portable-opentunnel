@@ -17,10 +17,8 @@
 //! hosted service.
 //!
 //! The fixtures are written from the documented on-disk layout rather than by
-//! calling into `src/`, so these tests stay independent of internal refactors.
-//! The same layout is asserted separately by the unit tests in `src/state/`;
-//! keeping both means a layout change fails loudly in either place instead of
-//! silently desynchronising.
+//! calling into `src/`, so these tests stay independent of internal refactors
+//! and a change to a file name on disk fails here.
 
 #[path = "support/scratch.rs"]
 mod scratch;
@@ -29,7 +27,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 
 use scratch::{Scratch, binary};
 
@@ -38,27 +36,8 @@ use scratch::{Scratch, binary};
 // ---------------------------------------------------------------------------
 
 impl Scratch {
-    /// Runs the executable with a cleared, reproducible environment.
-    ///
-    /// `env_clear` also means no `*_PROXY`, `OPENTUNNEL_CA_CERT`,
-    /// `SSL_CERT_FILE`, or `SSL_CERT_DIR` leaks in from the developer's shell,
-    /// so a test can never be steered at a proxy or a private CA.
     fn run(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(binary());
-        command
-            .args(args)
-            .current_dir(self.cwd())
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", self.home())
-            .env("TMPDIR", self.tmp())
-            .env("XDG_DATA_HOME", self.path("xdg-data"))
-            .env("XDG_CONFIG_HOME", self.path("xdg-config"))
-            .env("XDG_STATE_HOME", self.path("xdg-state"))
-            .env("XDG_RUNTIME_DIR", self.path("xdg-runtime"))
-            .stdin(Stdio::null());
-
-        command
+        self.command(args)
             .output()
             .unwrap_or_else(|error| panic!("running {}: {error}", binary().display()))
     }
@@ -201,8 +180,23 @@ fn help_and_version_succeed_without_creating_state() {
         let output = scratch.run(&[flag]);
         assert_code(&output, 0, flag);
         assert!(
-            stdout(&output).contains("portable-opentunnel"),
-            "{flag} should describe the program: {}",
+            stdout(&output).contains("EXIT STATUS"),
+            "{flag} should document the exit codes: {}",
+            stdout(&output)
+        );
+    }
+
+    let output = scratch.run(&["ephemeral", "--help"]);
+    assert_code(&output, 0, "ephemeral --help");
+    for option in [
+        "--api",
+        "--ca-cert",
+        "--startup-timeout",
+        "--shutdown-timeout",
+    ] {
+        assert!(
+            stdout(&output).contains(option),
+            "ephemeral --help should list {option}: {}",
             stdout(&output)
         );
     }
@@ -226,8 +220,9 @@ fn invalid_ports_are_rejected_with_exit_2() {
     for target in ["0", "65536", "99999", "-1", "abc", "3000abc", "  "] {
         let output = scratch.run(&["ephemeral", target, "--api", FIXTURE_API]);
         assert_code(&output, 2, &format!("target {target:?}"));
+        assert!(stdout(&output).is_empty(), "stdout is only for the URL");
         assert!(
-            !stdout(&output).is_empty() || !stderr(&output).is_empty(),
+            !stderr(&output).is_empty(),
             "target {target:?} should explain the problem"
         );
         assert_no_secrets(&output);
@@ -265,9 +260,12 @@ fn incompatible_flag_combinations_are_rejected_with_exit_2() {
     let scratch = Scratch::new();
 
     let cases: &[(&[&str], &str)] = &[
-        (&["init", "3000"], "init with a target"),
-        (&["url", "3000"], "url with a target"),
-        (&["delete", "3000"], "delete with a target"),
+        (&["init", "3000", "--dir", "./state"], "init with a target"),
+        (&["url", "3000", "--dir", "./state"], "url with a target"),
+        (
+            &["delete", "3000", "--dir", "./state"],
+            "delete with a target",
+        ),
         (
             &[
                 "ephemeral",
@@ -488,6 +486,36 @@ fn url_metadata_without_a_completed_identity_exits_3() {
 }
 
 #[test]
+fn url_on_a_half_finished_deletion_exits_3_with_the_finishing_command() {
+    let scratch = Scratch::new();
+    let state = scratch.path("state");
+    initialized(&state, "abc123", "abc.opentunnel.xyz");
+    fs::write(
+        state.join("wrapper.json"),
+        wrapper_json("abc123", FIXTURE_API).replace('}', r#","remote_deleted":true}"#),
+    )
+    .unwrap();
+
+    let output = scratch.run(&["url", "--dir", state.to_str().unwrap()]);
+    assert_code(&output, 3, "url on a marked deletion");
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let stderr = stderr(&output);
+    assert!(stderr.contains("was deleted"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "portable-opentunnel delete --dir {}",
+            state.display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("--ca-cert"),
+        "finishing is offline: {stderr}"
+    );
+    assert_no_secrets(&output);
+}
+
+#[test]
 fn url_corrupt_metadata_exits_1() {
     let scratch = Scratch::new();
     let state = scratch.path("state");
@@ -623,6 +651,24 @@ fn delete_refuses_live_state_before_contacting_the_api() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn an_unusable_ca_from_the_environment_fails_before_anything_is_created() {
+    let scratch = Scratch::new();
+    let output = scratch
+        .command(&["ephemeral", "3000", "--api", FIXTURE_API])
+        .env("OPENTUNNEL_CA_CERT", "./absent.pem")
+        .output()
+        .expect("running the executable");
+    assert_code(&output, 1, "OPENTUNNEL_CA_CERT naming a missing file");
+    assert!(
+        stderr(&output).contains("CA certificate"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty());
+    scratch.assert_created_nothing();
+}
+
+#[test]
 fn forward_refuses_a_group_accessible_state_directory() {
     let scratch = Scratch::new();
     let state = scratch.path("state");
@@ -709,7 +755,7 @@ fn forward_refuses_an_unrelated_nonempty_directory() {
     ]);
     assert_code(&output, 1, "forward into an unrelated directory");
     assert!(
-        stderr(&output).contains("not a real directory") || stderr(&output).contains("not empty"),
+        stderr(&output).contains("not empty"),
         "stderr should refuse to initialise there: {}",
         stderr(&output)
     );

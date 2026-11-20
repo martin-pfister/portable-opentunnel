@@ -6,6 +6,7 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,6 +82,28 @@ impl Scratch {
     /// The child's working directory, also used for relative path arguments.
     pub fn cwd(&self) -> PathBuf {
         self.path("cwd")
+    }
+
+    /// The executable with a cleared, reproducible environment.
+    ///
+    /// `env_clear` means no `*_PROXY`, `OPENTUNNEL_CA_CERT`, `SSL_CERT_FILE`,
+    /// or `SSL_CERT_DIR` leaks in from the developer's shell, so a test can
+    /// never be steered at a proxy or a private CA.
+    pub fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(binary());
+        command
+            .args(args)
+            .current_dir(self.cwd())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", self.home())
+            .env("TMPDIR", self.tmp())
+            .env("XDG_DATA_HOME", self.path("xdg-data"))
+            .env("XDG_CONFIG_HOME", self.path("xdg-config"))
+            .env("XDG_STATE_HOME", self.path("xdg-state"))
+            .env("XDG_RUNTIME_DIR", self.path("xdg-runtime"))
+            .stdin(Stdio::null());
+        command
     }
 }
 

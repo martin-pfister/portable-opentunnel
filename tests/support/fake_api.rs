@@ -11,7 +11,7 @@
 //! GET    /api/tunnel/:id                -> 200 TunnelInfo
 //! POST   /api/tunnel/:id/certificate    -> 202 CertificateInfo
 //! GET    /api/tunnel/:id/certificate    -> 200 CertificateInfo
-//! DELETE /api/tunnel/:id                -> 204
+//! DELETE /api/tunnel/:id                -> 204 (401 bad token, 404 unknown)
 //! GET    /api/tunnel/:id/connect        -> 101 upgrade to the bridge
 //! ```
 //!
@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ use opentunnel::protocol::api::{
 use opentunnel::protocol::bridge::{self, ClientMessage, ServerMessage};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
-    DnType, IsCa, Issuer, KeyPair, SanType,
+    DnType, IsCa, Issuer, KeyPair, SanType, SerialNumber,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig};
@@ -149,6 +149,11 @@ impl TestCa {
         ];
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
         params.not_after = rcgen::date_time_ymd(2035, 1, 1);
+        // Without a serial, rcgen derives one from the public key, so a renewal
+        // for the same CSR could come out byte-identical and the SDK would not
+        // treat it as renewed.
+        static SERIAL: AtomicU64 = AtomicU64::new(1);
+        params.serial_number = Some(SerialNumber::from(SERIAL.fetch_add(1, Ordering::SeqCst)));
         let leaf = params
             .signed_by(&request.public_key, &self.issuer)
             .map_err(|error| format!("signing the CSR: {error}"))?;
@@ -205,20 +210,18 @@ pub struct Behaviour {
     pub certificate_failure: Option<String>,
     /// Never leave `issuing`, so attachment can never become ready.
     pub certificate_never_ready: bool,
-    /// Answer this many certificate GETs with `issuing` first.
-    pub issuing_polls: usize,
     /// Delay every certificate GET, to hold a refresh in flight.
     pub certificate_delay: Duration,
+    /// Answer every certificate GET with a newly signed certificate, as a
+    /// server that just renewed would. The SDK saves a renewed certificate,
+    /// so a refresh still running would write to the profile.
+    pub renew_certificates: bool,
     /// Reject `DELETE` with this status.
     pub delete_status: Option<u16>,
+    /// Hold every `DELETE` this long before answering.
+    pub delete_delay: Duration,
     /// Reject the attach with this code and close the bridge.
     pub attach_error: Option<String>,
-    /// Close the bridge right after attach, to exercise reconnection.
-    ///
-    /// Drops *every* attach while set. Prefer [`Self::drop_first_attach_only`]:
-    /// flipping this from the test races the SDK's reconnect, because the retry
-    /// can attach while the flag is still `true`.
-    pub drop_after_attach: bool,
     /// Close the bridge after the **first** attach only, then behave normally.
     ///
     /// The fixture consumes this itself, so no test-side flag flip is needed and
@@ -239,16 +242,14 @@ pub struct Behaviour {
 pub struct Metrics {
     pub creates: AtomicUsize,
     pub binds: AtomicUsize,
-    pub polls: AtomicUsize,
+    /// `DELETE` requests received, counted on arrival.
+    pub delete_requests: AtomicUsize,
+    /// Registrations actually deleted.
     pub deletes: AtomicUsize,
     pub attaches: AtomicUsize,
     pub opens: AtomicUsize,
-    pub backend_requests: AtomicUsize,
-    /// Certificate GETs currently inside the fixture's delay.
-    ///
-    /// Unlike `polls`, which only proves a request happened at some point, a
-    /// non-zero value here proves one is **in flight right now** — the state a
-    /// shutdown must survive.
+    /// Certificate GETs currently inside the fixture's delay: a non-zero value
+    /// proves one is **in flight right now**, the state a shutdown must survive.
     pub active_refresh: AtomicUsize,
 }
 
@@ -257,7 +258,6 @@ struct Tunnel {
     hostname: String,
     csr: Option<String>,
     certificate: Option<(String, String, String)>,
-    polls: usize,
     deleted: bool,
 }
 
@@ -268,10 +268,8 @@ struct Shared {
     ca: Arc<TestCa>,
     backend: Option<SocketAddr>,
     counter: Arc<AtomicUsize>,
-    /// Route labels the bridge last saw, for diagnostics.
-    routes: Arc<Mutex<Vec<String>>>,
     /// The plaintext response the visitor received, once the exchange is done.
-    visitor_response: Arc<AsyncMutex<Option<String>>>,
+    visitor_response: AsyncMutex<Option<String>>,
 }
 
 /// The running fixture. Dropping it stops the listener and joins the thread.
@@ -281,8 +279,6 @@ pub struct FakeApi {
     pub behaviour: Arc<Mutex<Behaviour>>,
     shared: Arc<Shared>,
     https: bool,
-    /// Set when the visitor exchange completed with a backend response.
-    visitor_response: Arc<AsyncMutex<Option<String>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -329,7 +325,6 @@ impl FakeApi {
         // thread, and the address comes back over a channel.
         let (address_tx, address_rx) = std::sync::mpsc::channel::<SocketAddr>();
         let metrics = Arc::new(Metrics::default());
-        let visitor_response = Arc::new(AsyncMutex::new(None));
         let shared = Arc::new(Shared {
             metrics: Arc::clone(&metrics),
             behaviour: Arc::new(Mutex::new(Behaviour::default())),
@@ -337,8 +332,7 @@ impl FakeApi {
             ca: Arc::new(ca),
             backend,
             counter: Arc::new(AtomicUsize::new(0)),
-            routes: Arc::new(Mutex::new(Vec::new())),
-            visitor_response: Arc::clone(&visitor_response),
+            visitor_response: AsyncMutex::new(None),
         });
 
         let server_shared = Arc::clone(&shared);
@@ -372,7 +366,6 @@ impl FakeApi {
             behaviour: Arc::clone(&shared.behaviour),
             shared,
             https,
-            visitor_response,
             stop,
             thread: Some(thread),
         }
@@ -399,14 +392,6 @@ impl FakeApi {
         self.shared.ca.ca_path()
     }
 
-    pub fn ca_pem(&self) -> &str {
-        self.shared.ca.ca_pem()
-    }
-
-    pub fn set(&self, behaviour: Behaviour) {
-        *self.behaviour.lock().unwrap() = behaviour;
-    }
-
     pub fn change(&self, f: impl FnOnce(&mut Behaviour)) {
         f(&mut self.behaviour.lock().unwrap());
     }
@@ -419,8 +404,8 @@ impl FakeApi {
         self.metrics.binds.load(Ordering::SeqCst)
     }
 
-    pub fn polls(&self) -> usize {
-        self.metrics.polls.load(Ordering::SeqCst)
+    pub fn delete_requests(&self) -> usize {
+        self.metrics.delete_requests.load(Ordering::SeqCst)
     }
 
     pub fn deletes(&self) -> usize {
@@ -435,27 +420,9 @@ impl FakeApi {
         self.metrics.opens.load(Ordering::SeqCst)
     }
 
-    pub fn backend_requests(&self) -> usize {
-        self.metrics.backend_requests.load(Ordering::SeqCst)
-    }
-
     /// Certificate GETs currently held inside the fixture's delay.
-    ///
-    /// A non-zero value proves a refresh is in flight *now*, which `polls()`
-    /// (a monotonic count) cannot show.
     pub fn active_refreshes(&self) -> usize {
         self.metrics.active_refresh.load(Ordering::SeqCst)
-    }
-
-    /// Registered hostname of the (single) created tunnel.
-    pub fn hostname(&self) -> Option<String> {
-        self.shared
-            .tunnels
-            .lock()
-            .unwrap()
-            .values()
-            .next()
-            .map(|tunnel| tunnel.hostname.clone())
     }
 
     /// True when every registration the fixture created has been deleted.
@@ -470,7 +437,7 @@ impl FakeApi {
 
     /// The plaintext HTTP response the visitor received through the tunnel.
     pub async fn visitor_response(&self) -> Option<String> {
-        self.visitor_response.lock().await.clone()
+        self.shared.visitor_response.lock().await.clone()
     }
 
     /// Waits until the visitor exchange produced a response.
@@ -663,36 +630,50 @@ where
         None => (rest.to_owned(), String::new()),
     };
 
-    if request.method == "DELETE" && suffix.is_empty() {
-        let behaviour = shared.behaviour.lock().unwrap().clone();
-        if let Some(status) = behaviour.delete_status {
-            return respond_error(&mut stream, status, "InternalError", "delete failed").await;
-        }
-        // Scope the guard: it must not live across the response `.await`.
-        let deleted = {
-            let mut tunnels = shared.tunnels.lock().unwrap();
-            match tunnels.get_mut(&id) {
-                Some(tunnel) => {
-                    tunnel.deleted = true;
-                    true
-                }
-                None => false,
-            }
-        };
-        return if deleted {
-            shared.metrics.deletes.fetch_add(1, Ordering::SeqCst);
-            respond(&mut stream, 204, b"", "text/plain").await
-        } else {
-            respond_error(&mut stream, 404, "NotFoundError", "no such tunnel").await
-        };
-    }
-
-    // Every other endpoint requires the bearer token of a live tunnel.
     let token = request
         .headers
         .get("authorization")
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::to_owned);
+
+    if request.method == "DELETE" && suffix.is_empty() {
+        shared
+            .metrics
+            .delete_requests
+            .fetch_add(1, Ordering::SeqCst);
+        let behaviour = shared.behaviour.lock().unwrap().clone();
+        if !behaviour.delete_delay.is_zero() {
+            tokio::time::sleep(behaviour.delete_delay).await;
+        }
+        if let Some(status) = behaviour.delete_status {
+            return respond_error(&mut stream, status, "InternalError", "delete failed").await;
+        }
+        // An unknown or already deleted tunnel is a 404 whatever the token;
+        // a live one needs its own token. The guard must not live across the
+        // response `.await`.
+        let status = {
+            let mut tunnels = shared.tunnels.lock().unwrap();
+            match tunnels.get_mut(&id) {
+                Some(tunnel) if tunnel.deleted => 404,
+                Some(tunnel) if token.as_deref() != Some(tunnel.token.as_str()) => 401,
+                Some(tunnel) => {
+                    tunnel.deleted = true;
+                    204
+                }
+                None => 404,
+            }
+        };
+        return match status {
+            204 => {
+                shared.metrics.deletes.fetch_add(1, Ordering::SeqCst);
+                respond(&mut stream, 204, b"", "text/plain").await
+            }
+            401 => respond_error(&mut stream, 401, "UnauthorizedError", "bad token").await,
+            _ => respond_error(&mut stream, 404, "NotFoundError", "no such tunnel").await,
+        };
+    }
+
+    // Every other endpoint requires the bearer token of a live tunnel.
     let authorized = shared
         .tunnels
         .lock()
@@ -778,7 +759,6 @@ where
         }
         ("GET", "/certificate") => {
             let behaviour = shared.behaviour.lock().unwrap().clone();
-            shared.metrics.polls.fetch_add(1, Ordering::SeqCst);
             // Count this request as in flight *while* the delay holds it, so a
             // test can observe the real state rather than infer it from a count
             // that only ever grows. The guard decrements on every exit path,
@@ -795,13 +775,7 @@ where
                 };
                 return respond_json(&mut stream, 200, &info).await;
             }
-            let polls = {
-                let mut tunnels = shared.tunnels.lock().unwrap();
-                let tunnel = tunnels.get_mut(&id).unwrap();
-                tunnel.polls += 1;
-                tunnel.polls
-            };
-            if behaviour.certificate_never_ready || polls <= behaviour.issuing_polls {
+            if behaviour.certificate_never_ready {
                 let info = CertificateInfo {
                     id: format!("cert-{id}"),
                     state: CertificateState::Issuing,
@@ -813,7 +787,10 @@ where
             let resolved = {
                 let mut tunnels = shared.tunnels.lock().unwrap();
                 let tunnel = tunnels.get_mut(&id).unwrap();
-                let cached = tunnel.certificate.clone();
+                let cached = tunnel
+                    .certificate
+                    .clone()
+                    .filter(|_| !behaviour.renew_certificates);
                 let signing = if cached.is_none() {
                     let csr = tunnel.csr.clone().unwrap_or_default();
                     let hostname = tunnel.hostname.clone();
@@ -891,7 +868,6 @@ async fn create_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
             hostname: hostname.clone(),
             csr: None,
             certificate: None,
-            polls: 0,
             deleted: false,
         },
     );
@@ -948,17 +924,12 @@ where
         Some(routes) => routes,
         None => return Ok(()),
     };
-    *shared.routes.lock().unwrap() = routes.clone();
-    let behaviour = {
+    let (behaviour, drop_after_attach) = {
         let mut guard = shared.behaviour.lock().unwrap();
         // Consume the one-shot drop under a single lock so exactly the first
         // attach is dropped, no matter how fast the client reconnects.
         let one_shot = std::mem::take(&mut guard.drop_first_attach_only);
-        let mut behaviour = guard.clone();
-        if one_shot {
-            behaviour.drop_after_attach = true;
-        }
-        behaviour
+        (guard.clone(), one_shot)
     };
 
     // Hold the Attached reply, so a test can interrupt while the bridge is
@@ -985,16 +956,16 @@ where
     )
     .await?;
 
-    if behaviour.drop_after_attach {
+    if drop_after_attach {
         let _ = socket.close(None).await;
         return Ok(());
     }
 
-    let Some(backend) = shared.backend else {
+    if shared.backend.is_none() {
         // No visitor traffic: stay attached until the client closes.
         drain(&mut socket).await;
         return Ok(());
-    };
+    }
 
     // One bounded visitor exchange per attach.
     let hostname = shared
@@ -1024,7 +995,7 @@ where
     )
     .await?;
 
-    let _ = visit(&mut socket, conn, &sni, backend, Arc::clone(&shared)).await;
+    let _ = visit(&mut socket, conn, &sni, &shared).await;
     // A healthy session must NOT be closed here. Closing it would make the SDK
     // legitimately reconnect, and that reconnect opens a second visitor
     // connection — so any test asserting "one session carried traffic" would be
@@ -1081,13 +1052,7 @@ async fn send(socket: &mut Bridge, message: &ServerMessage) -> io::Result<()> {
 ///
 /// Returns the plaintext response the backend produced, and records it on the
 /// fixture so a test can wait for it without owning the bridge task.
-async fn visit(
-    socket: &mut Bridge,
-    conn: u32,
-    sni: &str,
-    backend: SocketAddr,
-    shared: Arc<Shared>,
-) -> io::Result<String> {
+async fn visit(socket: &mut Bridge, conn: u32, sni: &str, shared: &Shared) -> io::Result<String> {
     let config = shared.ca.client_config();
     let server_name = ServerName::try_from(sni.to_owned()).map_err(io::Error::other)?;
     let mut tls = ClientConnection::new(config, server_name).map_err(io::Error::other)?;
@@ -1172,7 +1137,6 @@ async fn visit(
         }
     }
 
-    let _ = backend;
     let text = String::from_utf8_lossy(&response).into_owned();
     *shared.visitor_response.lock().await = Some(text.clone());
     Ok(text)
@@ -1182,35 +1146,33 @@ async fn visit(
 // Backend HTTP server
 // ---------------------------------------------------------------------------
 
-/// Starts a loopback HTTP backend that answers `200` with `body`, counting
-/// requests. Returns its address.
-pub async fn start_backend(body: &'static str, counter: Arc<AtomicUsize>) -> SocketAddr {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let counter = Arc::clone(&counter);
-            tokio::spawn(async move {
-                let mut buffer = Vec::new();
-                let mut chunk = [0u8; 1024];
-                while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                    match stream.read(&mut chunk).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                    }
+/// The body every backend answers with.
+pub const BACKEND_BODY: &str = "hello-from-backend";
+
+/// Accepts connections until the listener fails, answering one HTTP request
+/// per connection with `200` and [`BACKEND_BODY`], and counting it.
+pub async fn serve_backend(listener: TcpListener, requests: Arc<AtomicUsize>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
                 }
-                counter.fetch_add(1, Ordering::SeqCst);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.flush().await;
-            });
-        }
-    });
-    address
+            }
+            requests.fetch_add(1, Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{BACKEND_BODY}",
+                BACKEND_BODY.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+    }
 }

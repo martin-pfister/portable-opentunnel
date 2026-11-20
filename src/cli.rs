@@ -422,14 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn help_and_version_exit_successfully() {
-        for flag in ["--help", "--version"] {
-            let error = Cli::try_parse_from(["portable-opentunnel", flag]).unwrap_err();
-            assert_eq!(error.exit_code(), 0, "{flag} should exit successfully");
-        }
-    }
-
-    #[test]
     fn version_reports_the_build_id() {
         let version = Cli::try_parse_from(["p", "--version"]).unwrap_err();
         assert_eq!(

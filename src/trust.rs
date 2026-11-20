@@ -6,6 +6,7 @@
 //! come from the environment: reqwest and the bridge code honor
 //! `HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` (and lowercase forms).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
@@ -24,11 +25,11 @@ const CA_ENV: &str = "OPENTUNNEL_CA_CERT";
 /// The path is made absolute because it is also printed in retry commands,
 /// which may be run from another directory.
 pub fn resolve_ca_cert(cli: Option<PathBuf>) -> AppResult<Option<PathBuf>> {
-    let chosen = cli.or_else(|| {
-        std::env::var_os(CA_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    });
+    resolve_with(cli, std::env::var_os(CA_ENV))
+}
+
+fn resolve_with(cli: Option<PathBuf>, env: Option<OsString>) -> AppResult<Option<PathBuf>> {
+    let chosen = cli.or_else(|| env.filter(|value| !value.is_empty()).map(PathBuf::from));
     let Some(path) = chosen else {
         return Ok(None);
     };
@@ -56,24 +57,50 @@ mod tests {
 
     use crate::test_support::TempDir;
 
-    #[test]
-    fn accepts_a_real_certificate() {
+    fn ca_file(temp: &TempDir, name: &str) -> PathBuf {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::new()).unwrap();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let pem = params.self_signed(&key).unwrap().pem();
+        let path = temp.path().join(name);
+        std::fs::write(&path, params.self_signed(&key).unwrap().pem()).unwrap();
+        path
+    }
 
+    #[test]
+    fn accepts_a_real_certificate() {
         let temp = TempDir::new();
-        let path = temp.path().join("ca.pem");
-        std::fs::write(&path, pem).unwrap();
-        assert_eq!(resolve_ca_cert(Some(path.clone())).unwrap(), Some(path));
+        let path = ca_file(&temp, "ca.pem");
+        assert_eq!(resolve_with(Some(path.clone()), None).unwrap(), Some(path));
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_environment() {
+        let temp = TempDir::new();
+        let flag = ca_file(&temp, "flag.pem");
+        let env = temp.path().join("absent.pem").into_os_string();
+        assert_eq!(
+            resolve_with(Some(flag.clone()), Some(env)).unwrap(),
+            Some(flag)
+        );
+    }
+
+    #[test]
+    fn the_environment_is_the_fallback_and_empty_means_unset() {
+        let temp = TempDir::new();
+        let env = ca_file(&temp, "env.pem");
+        assert_eq!(
+            resolve_with(None, Some(env.clone().into_os_string())).unwrap(),
+            Some(env)
+        );
+        assert_eq!(resolve_with(None, Some(OsString::new())).unwrap(), None);
+        assert_eq!(resolve_with(None, None).unwrap(), None);
     }
 
     #[test]
     fn rejects_a_missing_file_early() {
         let temp = TempDir::new();
-        let error = resolve_ca_cert(Some(temp.path().join("absent.pem"))).unwrap_err();
+        let error = resolve_with(Some(temp.path().join("absent.pem")), None).unwrap_err();
         assert!(error.message.contains("CA certificate"), "{error}");
     }
 
@@ -82,7 +109,7 @@ mod tests {
         let temp = TempDir::new();
         let path = temp.path().join("garbage.pem");
         std::fs::write(&path, b"not a certificate").unwrap();
-        let error = resolve_ca_cert(Some(path)).unwrap_err();
+        let error = resolve_with(Some(path), None).unwrap_err();
         assert!(error.message.contains("CA certificate"), "{error}");
         assert!(
             error.message.contains("no PEM certificates") || error.message.contains("invalid CA"),
@@ -98,7 +125,7 @@ mod tests {
         let link = temp.path().join("link.pem");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         for path in [link, temp.path().to_path_buf()] {
-            let error = resolve_ca_cert(Some(path)).unwrap_err();
+            let error = resolve_with(Some(path), None).unwrap_err();
             assert!(error.message.contains("not a regular file"), "{error}");
         }
     }
